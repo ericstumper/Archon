@@ -60,7 +60,6 @@ export {
   registerPiProvider,
   type PiProviderDefaults,
 } from './community/pi';
-
 export {
   CopilotProvider,
   parseCopilotConfig,
@@ -72,3 +71,9 @@ export {
   resolveCopilotBinaryPath,
   fileExists as copilotFileExists,
 } from './community/copilot/binary-resolver';
+export {
+  OmpProvider,
+  parseOmpConfig,
+  registerOmpProvider,
+  type OmpProviderDefaults,
+} from './community/omp';

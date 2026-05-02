@@ -40,7 +40,8 @@ import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
 import { createLogger } from '@archon/paths';
-import { loadMcpConfig } from '../mcp/config';
+import { loadMcpConfig } from '../mcp-config';
+export { loadMcpConfig } from '../mcp-config';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;

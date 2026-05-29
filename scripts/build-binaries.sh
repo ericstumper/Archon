@@ -85,7 +85,7 @@ for target_pair in "${TARGETS[@]}"; do
   echo "Building $target → $outfile"
 
   # --bytecode disabled: Bun 1.3.11 produces broken bytecode for our module graph
-  # (likely triggered by @mariozechner/pi-coding-agent's CJS/ESM interop shape) —
+  # (likely triggered by @earendil-works/pi-coding-agent's CJS/ESM interop shape) —
   # "TypeError: Expected CommonJS module to have a function wrapper" at runtime.
   # Always --minify to match release parity.
   # PDF conversion is patched out above because markit-ai reaches mupdf through

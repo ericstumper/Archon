@@ -30,9 +30,9 @@
     "@github/copilot-sdk": "~0.2.2",
     "@earendil-works/pi-ai": "^0.76.0",
     "@earendil-works/pi-coding-agent": "^0.76.0",
-    "@oh-my-pi/pi-agent-core": "^15.3.2",
-    "@oh-my-pi/pi-ai": "^15.3.2",
-    "@oh-my-pi/pi-coding-agent": "^15.3.2",
+    "@oh-my-pi/pi-agent-core": "15.7.2",
+    "@oh-my-pi/pi-ai": "15.7.2",
+    "@oh-my-pi/pi-coding-agent": "15.7.2",
     "@opencode-ai/sdk": "^1.14.20",
     "@openai/codex-sdk": "^0.125.0",
     "@sinclair/typebox": "^0.34.41"

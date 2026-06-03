@@ -41,6 +41,7 @@ import type {
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
+  WorkflowSource,
 } from './schemas';
 import {
   isBashNode,
@@ -51,7 +52,7 @@ import {
   isApprovalContext,
 } from './schemas';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { evaluateCondition } from './condition-evaluator';
 import {
@@ -1039,8 +1040,8 @@ async function executeNodeInternal(
       }
     }
 
-    // If the node completed via idle timeout, log it
-    if (nodeIdleTimedOut) {
+    // Only post "completed via idle timeout" when output exists — zero-output timeout falls through to the empty-output guard below.
+    if (nodeIdleTimedOut && (nodeOutputText.trim() !== '' || structuredOutput !== undefined)) {
       getLog().warn(
         { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
         'dag_node_completed_via_idle_timeout'
@@ -1134,18 +1135,12 @@ async function executeNodeInternal(
       return { state: 'failed', output: nodeOutputText, error: creditError };
     }
 
-    // Empty assistant output is a failure for AI nodes — a provider stream
-    // that closed cleanly with zero content typically means a silent
-    // rejection or interruption that didn't produce a result.isError chunk.
-    // Bash/script/approval nodes don't reach this path; they have their
-    // own dispatch and never stream through this loop.
-    //
-    // Idle-timeout exits are exempt: the timeout warning at line 1017 has
-    // already told the user the node "completed via idle timeout"; flipping
-    // that to a failure here would directly contradict the on-screen message.
-    if (nodeOutputText.trim() === '' && structuredOutput === undefined && !nodeIdleTimedOut) {
+    // Fail for zero output: covers both silent non-timeout exits AND idle-timeout before first token (time-to-first-token exceeded the window).
+    if (nodeOutputText.trim() === '' && structuredOutput === undefined) {
       const duration = Date.now() - nodeStartTime;
-      const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
+      const emptyError = nodeIdleTimedOut
+        ? `Node '${node.id}' timed out with no output (idle for ${String(effectiveIdleTimeout / 60000)} min). The provider did not emit any content before the watchdog fired — likely time-to-first-token exceeded the timeout. Consider increasing idle_timeout or reducing prompt size.`
+        : `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
       await logNodeError(logDir, workflowRun.id, node.id, emptyError);
 
@@ -2199,6 +2194,11 @@ async function executeLoopNode(
             CONTEXT: issueContext ?? '',
             EXTERNAL_CONTEXT: issueContext ?? '',
             ISSUE_CONTEXT: issueContext ?? '',
+            // Managed per-project env vars + per-user GitHub token overrides
+            // (incl. the unconnected-user scrub) must win last, exactly as
+            // executeBashNode/executeScriptNode do — otherwise until_bash would
+            // inherit the server's ambient GH token and bypass the scrub.
+            ...(config.envVars ?? {}),
           },
         });
         bashComplete = true; // exit 0 = complete
@@ -2584,7 +2584,9 @@ export async function executeDagWorkflow(
   config: WorkflowConfig,
   configuredCommandFolder?: string,
   issueContext?: string,
-  priorCompletedNodes?: Map<string, string>
+  priorCompletedNodes?: Map<string, string>,
+  /** Discovery source — telemetry only (custom-vs-default + name redaction). */
+  source?: WorkflowSource
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
   const workflowLevelOptions = {
@@ -3339,6 +3341,20 @@ export async function executeDagWorkflow(
           `${nodeCounts.skipped} downstream node${nodeCounts.skipped !== 1 ? 's were' : ' was'} skipped.`
         : `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
           'Check node conditions, trigger rules, and upstream failures.';
+    // Anonymous telemetry: terminal failure (no successful nodes). Counts/
+    // duration are in scope here even though they aren't persisted to the DB row.
+    captureWorkflowCompleted({
+      outcome: 'failed',
+      workflowName: workflow.name,
+      workflowSource: source,
+      provider: workflowProvider,
+      durationMs: Date.now() - dagStartTime,
+      nodesCompleted: nodeCounts.completed,
+      nodesFailed: nodeCounts.failed,
+      nodesSkipped: nodeCounts.skipped,
+      nodesTotal: nodeCounts.total,
+      exitReason: 'no_nodes_completed',
+    });
     // Note: nodeCounts not stored for failed runs — failWorkflowRun only stores { error }.
     // Frontend guards with isValidNodeCounts so missing node_counts is safe.
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
@@ -3372,6 +3388,19 @@ export async function executeDagWorkflow(
       .map(([id, o]) => `'${id}': ${o.state === 'failed' ? o.error : 'unknown'}`)
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
+    // Anonymous telemetry: terminal failure (some nodes failed).
+    captureWorkflowCompleted({
+      outcome: 'failed',
+      workflowName: workflow.name,
+      workflowSource: source,
+      provider: workflowProvider,
+      durationMs: Date.now() - dagStartTime,
+      nodesCompleted: nodeCounts.completed,
+      nodesFailed: nodeCounts.failed,
+      nodesSkipped: nodeCounts.skipped,
+      nodesTotal: nodeCounts.total,
+      exitReason: 'node_error',
+    });
     await deps.store.failWorkflowRun(workflowRun.id, failMsg).catch((dbErr: Error) => {
       getLog().error({ err: dbErr, workflowRunId: workflowRun.id }, 'dag_db_fail_failed');
     });
@@ -3426,6 +3455,18 @@ export async function executeDagWorkflow(
     runId: workflowRun.id,
     workflowName: workflow.name,
     duration,
+  });
+  // Anonymous telemetry: successful terminal run with outcome + duration + counts.
+  captureWorkflowCompleted({
+    outcome: 'completed',
+    workflowName: workflow.name,
+    workflowSource: source,
+    provider: workflowProvider,
+    durationMs: duration,
+    nodesCompleted: nodeCounts.completed,
+    nodesFailed: nodeCounts.failed,
+    nodesSkipped: nodeCounts.skipped,
+    nodesTotal: nodeCounts.total,
   });
   deps.store
     .createWorkflowEvent({

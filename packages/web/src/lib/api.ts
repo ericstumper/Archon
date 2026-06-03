@@ -69,6 +69,60 @@ export async function listProviders(): Promise<ProviderInfo[]> {
   return data.providers;
 }
 
+// Web auth status (opt-in). Drives the login gate: when `enabled` is false the
+// UI renders exactly as before (no login). `signup` reports the invite posture:
+//   - 'allowlist' — invite-only (allowlisted emails)
+//   - 'open'      — anyone may register
+//   - 'disabled'  — self-serve signup is off (login only); hide signup UI
+export interface AuthStatus {
+  enabled: boolean;
+  signup: 'allowlist' | 'open' | 'disabled';
+}
+
+export async function getAuthStatus(): Promise<AuthStatus> {
+  return fetchJSON<AuthStatus>('/api/auth/status');
+}
+
+// GitHub device-flow connect
+export interface GithubDeviceStart {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  interval: number;
+  expires_in: number;
+}
+
+export interface GithubDevicePoll {
+  status: 'pending' | 'connected' | 'expired' | 'denied' | 'error';
+  githubLogin?: string;
+  detail?: string;
+}
+
+export interface GithubConnectionStatus {
+  connected: boolean;
+  githubLogin: string | null;
+}
+
+export async function getGithubConnection(): Promise<GithubConnectionStatus> {
+  return fetchJSON<GithubConnectionStatus>('/api/auth/github');
+}
+
+export async function startGithubDeviceFlow(): Promise<GithubDeviceStart> {
+  return fetchJSON<GithubDeviceStart>('/api/auth/github/device/start', { method: 'POST' });
+}
+
+export async function pollGithubDeviceFlow(deviceCode: string): Promise<GithubDevicePoll> {
+  return fetchJSON<GithubDevicePoll>('/api/auth/github/device/poll', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_code: deviceCode }),
+  });
+}
+
+export async function disconnectGithub(): Promise<{ success: boolean }> {
+  return fetchJSON<{ success: boolean }>('/api/auth/github', { method: 'DELETE' });
+}
+
 // Conversations
 export async function listConversations(codebaseId?: string): Promise<ConversationResponse[]> {
   const params = new URLSearchParams();

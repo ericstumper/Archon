@@ -32,11 +32,18 @@ import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { findWorkflow } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  assertWorkflowRequirementsMet,
+  WorkflowRequirementError,
+} from '@archon/workflows/utils/workflow-requirements';
 import type {
   WorkflowDefinition,
   WorkflowWithSource,
   WorkflowLoadError,
+  WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
+import { isPerUserGitHubEnabled } from '../github-auth/config';
+import { getDecryptedAccessToken } from '../db/user-github-token-store';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { loadConfig } from '../config/config-loader';
 import type { MergedConfig } from '../config/config-types';
@@ -316,8 +323,34 @@ async function dispatchOrchestratorWorkflow(
   workflow: WorkflowDefinition,
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
-  userId?: string
+  userId?: string,
+  /**
+   * Discovery source of the workflow — telemetry only (bundled workflows
+   * report their real name, custom ones report "custom"). Optional: callers
+   * that don't have it readily in scope omit it and the run reports "custom".
+   */
+  source?: WorkflowSource
 ): Promise<void> {
+  // Capability gate: hard-fail before any worktree/clone/AI cost if the
+  // workflow declares `requires: [github]` and the originating user hasn't
+  // connected. No-op when per-user GitHub is disabled (solo PAT installs).
+  if (isPerUserGitHubEnabled() && workflow.requires?.length) {
+    const githubConnected = userId ? Boolean(await getDecryptedAccessToken(userId)) : false;
+    try {
+      assertWorkflowRequirementsMet(workflow, { githubConnected });
+    } catch (err) {
+      if (err instanceof WorkflowRequirementError) {
+        getLog().info(
+          { workflowName: workflow.name, conversationId, userId, requirement: err.requirement },
+          'workflow.requirement_unmet'
+        );
+        await platform.sendMessage(conversationId, err.message);
+        return;
+      }
+      throw err;
+    }
+  }
+
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
     codebase_id: codebase.id,
@@ -389,7 +422,29 @@ async function dispatchOrchestratorWorkflow(
     // gate) — surface that to the user and fall through to a fresh run on
     // the same worktree rather than silently restarting.
     const deps = createWorkflowDeps();
-    const prepared = await hydrateResumableRun(deps, resumableRun);
+    let prepared: Awaited<ReturnType<typeof hydrateResumableRun>>;
+    try {
+      prepared = await hydrateResumableRun(deps, resumableRun);
+    } catch (err) {
+      // resumeWorkflowRun is a compare-and-swap: if another surface (web Resume,
+      // a concurrent re-dispatch, the CLI) already claimed this run, it throws
+      // WorkflowNotResumableError. Surface a friendly note instead of leaking the
+      // raw internal string to the generic failure catch, and do NOT fall through
+      // to a fresh run — the other resumer owns the worktree (#1830 I2).
+      if (err instanceof workflowDb.WorkflowNotResumableError) {
+        getLog().info(
+          { workflowName: workflow.name, runId: resumableRun.id, status: err.currentStatus },
+          'orchestrator.resume_lost_race'
+        );
+        await platform.sendMessage(
+          conversationId,
+          `⚠️ **${workflow.name}** is already being resumed (status: ${err.currentStatus}). ` +
+            'No action taken — follow the existing run for progress.'
+        );
+        return;
+      }
+      throw err;
+    }
     if (prepared) {
       await executeWorkflow(
         deps,
@@ -403,6 +458,7 @@ async function dispatchOrchestratorWorkflow(
           codebaseId: codebase.id,
           parentConversationId: conversation.id,
           userId,
+          source,
           ...prepared,
         }
       );
@@ -423,6 +479,7 @@ async function dispatchOrchestratorWorkflow(
           codebaseId: codebase.id,
           parentConversationId: conversation.id,
           userId,
+          source,
         }
       );
     }
@@ -439,6 +496,7 @@ async function dispatchOrchestratorWorkflow(
         availableWorkflows: [workflow],
         isolationHints,
         userId,
+        source,
       },
       workflow
     );
@@ -456,6 +514,7 @@ async function dispatchOrchestratorWorkflow(
         codebaseId: codebase.id,
         parentConversationId: conversation.id,
         userId,
+        source,
       }
     );
   }
@@ -746,6 +805,9 @@ export async function handleMessage(
           const { workflows: discoveredWorkflows } = await discoverAllWorkflows(conversation);
           const allWorkflows: WorkflowDefinition[] = discoveredWorkflows.map(w => w.workflow);
           const workflow = findWorkflow(pausedRun.workflow_name, allWorkflows);
+          const workflowSource = workflow
+            ? discoveredWorkflows.find(w => w.workflow === workflow)?.source
+            : undefined;
           if (!workflow) {
             await platform.sendMessage(
               conversationId,
@@ -774,7 +836,8 @@ export async function handleMessage(
             workflow,
             pausedRun.user_message,
             isolationHints,
-            userId
+            userId,
+            workflowSource
           );
           getLog().info(
             { conversationId, workflowRunId: pausedRun.id, workflowName: pausedRun.workflow_name },
@@ -1783,7 +1846,8 @@ async function handleWorkflowRunCommand(
       resolvedWorkflow,
       userMessage,
       isolationHints,
-      userId
+      userId,
+      resolvedEntry?.source
     );
     return;
   }

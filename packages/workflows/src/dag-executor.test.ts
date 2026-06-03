@@ -16,6 +16,9 @@ const mockLogger = {
   fatal: mockLogFn,
   child: mock(() => mockLogger),
 };
+// Hoisted telemetry mock — declared before the mock.module factory runs so the
+// completion-telemetry tests can assert on it.
+const mockCaptureWorkflowCompleted = mock(() => {});
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
@@ -29,6 +32,9 @@ mock.module('@archon/paths', () => ({
   getHomeWorkflowsPath: () => '/nonexistent/home/workflows',
   getLegacyHomeWorkflowsPath: () => '/nonexistent/home/.archon/workflows',
   getArchonHome: () => '/nonexistent/home',
+  // Telemetry is fire-and-forget; mock as a no-op so terminal sites can call it.
+  // Hoisted so tests can assert outcome / exit_reason at each terminal site.
+  captureWorkflowCompleted: mockCaptureWorkflowCompleted,
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
@@ -405,6 +411,26 @@ describe('checkTriggerRule', () => {
     const n = node('c', ['a'], { trigger_rule: 'all_done' });
     const outputs = new Map<string, NodeOutput>(); // 'a' absent -> synthesised as failed -> terminal
     expect(checkTriggerRule(n, outputs)).toBe('run');
+  });
+});
+
+describe('checkTriggerRule -- classify-gated pipeline behavior on failure', () => {
+  it('all_success aspect skips when classify failed', () => {
+    const aspect = node('code-review', ['review-classify']);
+    const outputs = new Map([['review-classify', makeOutput('failed', '')]]);
+    expect(checkTriggerRule(aspect, outputs)).toBe('skip');
+  });
+
+  it('one_success synthesize skips when all aspects skipped (classify failed)', () => {
+    const synth = node('synthesize-review', ['code-review', 'error-handling', 'test-coverage'], {
+      trigger_rule: 'one_success',
+    });
+    const outputs = new Map([
+      ['code-review', makeOutput('skipped')],
+      ['error-handling', makeOutput('skipped')],
+      ['test-coverage', makeOutput('skipped')],
+    ]);
+    expect(checkTriggerRule(synth, outputs)).toBe('skip');
   });
 });
 
@@ -5330,6 +5356,132 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     expect(nodeCompletedEvents.length).toBeGreaterThan(0);
   });
 
+  it('idle-timeout with zero output produces node_failed, not node_completed', async () => {
+    // Regression test for #1807: idle-timeout before first token must fail, not silently complete.
+    // The generator yields nothing; idle_timeout fires before any output is produced.
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      // Wait for abort (idle timeout fires abort).
+      await new Promise<void>(resolve => {
+        if (options?.abortSignal?.aborted) {
+          resolve();
+        } else {
+          options?.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+        }
+      });
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'idle-timeout-no-output',
+        nodes: [
+          {
+            id: 'classify',
+            command: 'my-cmd',
+            idle_timeout: 50,
+            // Disable retries so the test doesn't wait for retry delays (the
+            // "timed out" message matches TRANSIENT patterns, which would trigger
+            // the default 2-retry / 3s-delay policy otherwise).
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents.length).toBeGreaterThan(0);
+    const failedData = (nodeFailedEvents[0][0] as Record<string, unknown>).data as Record<
+      string,
+      unknown
+    >;
+    expect(failedData.error).toContain('timed out with no output');
+    const nodeCompletedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    expect(nodeCompletedEvents.length).toBe(0);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('idle-timeout WITH output produces node_completed and sends warning, not node_failed', async () => {
+    // The "subprocess hung after AI finished" path must still complete the node, not fail it.
+    // Note: no `result` event — the generator yields content then hangs, so idle timeout fires
+    // before the generator exits. This is the "subprocess hung without sending result" case.
+    mockSendQueryDag.mockImplementation(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: { abortSignal?: AbortSignal }
+    ) {
+      yield { type: 'assistant', content: 'Here is the analysis result.' };
+      // Hang until abort signal fires (idle timeout aborts the controller)
+      await new Promise<void>(resolve => {
+        options?.abortSignal?.addEventListener('abort', () => resolve());
+      });
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'idle-timeout-with-output',
+        nodes: [{ id: 'step1', command: 'my-cmd', idle_timeout: 50, retry: { max_attempts: 0 } }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const nodeFailedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    expect(nodeFailedEvents.length).toBe(0);
+    const nodeCompletedEvents = eventCalls.filter(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_completed'
+    );
+    expect(nodeCompletedEvents.length).toBeGreaterThan(0);
+    const sentMessages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      (c: unknown[]) => c[1] as string
+    );
+    expect(sentMessages.some(m => m.includes('completed via idle timeout'))).toBe(true);
+  });
+
   it('fails the run when a node specifies an unknown provider (defense-in-depth at execution time)', async () => {
     // Loader-time validation also catches this (loader.ts iterates dagNodes
     // after parsing), but the dag-executor's resolveNodeProviderAndModel
@@ -8256,5 +8408,132 @@ describe('executeDagWorkflow -- persist_session', () => {
       .map((call: unknown[]) => call[1] as string)
       .some(m => m.includes('Could not persist') && m.includes('planner'));
     expect(warned).toBe(true);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Completion telemetry
+//
+// captureWorkflowCompleted is mocked as a no-op; without these assertions a
+// dropped call at any of the three terminal sites (success / partial-failure /
+// no-nodes-completed) would be invisible. Each test clears the hoisted mock
+// immediately before the run so the assertion is precise. `source: 'bundled'`
+// is threaded as the final arg to also confirm it reaches the telemetry payload.
+// ───────────────────────────────────────────────────────────────────────────
+describe('executeDagWorkflow -- completion telemetry', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-tel-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockCaptureWorkflowCompleted.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  async function runDag(workflow: { name: string; nodes: DagNode[] }): Promise<void> {
+    await executeDagWorkflow(
+      createMockDeps(createMockStore()),
+      createMockPlatform(),
+      'conv-dag',
+      testDir,
+      workflow,
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      'bundled'
+    );
+  }
+
+  it('emits outcome=completed with node counts and the threaded source on success', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'sid-ok' };
+    });
+
+    await runDag({ name: 'dag-ok', nodes: [{ id: 'step', prompt: 'Do thing.' }] });
+
+    // Exactly once — guards against the double-count risk the PR flagged.
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'completed',
+        workflowSource: 'bundled',
+        nodesCompleted: 1,
+        nodesTotal: 1,
+      })
+    );
+  });
+
+  it('emits outcome=failed exit_reason=no_nodes_completed when the only node fails', async () => {
+    // A result chunk with no assistant text fails the node (see "produced no
+    // assistant output" guard), leaving zero completed nodes.
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'result', sessionId: 'sid-empty' };
+    });
+
+    await runDag({ name: 'dag-empty', nodes: [{ id: 'only', prompt: 'Do thing.' }] });
+
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'failed',
+        workflowSource: 'bundled',
+        exitReason: 'no_nodes_completed',
+      })
+    );
+  });
+
+  it('emits outcome=failed exit_reason=node_error when one node completes and another fails', async () => {
+    // node2 depends on node1, so order is deterministic: node1 yields assistant
+    // text (completes), node2 yields only a result (fails) → 1 completed, 1 failed.
+    let call = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      call++;
+      if (call === 1) {
+        yield { type: 'assistant', content: 'first ok' };
+        yield { type: 'result', sessionId: 'sid-1' };
+      } else {
+        yield { type: 'result', sessionId: 'sid-2' };
+      }
+    });
+
+    await runDag({
+      name: 'dag-partial',
+      nodes: [
+        { id: 'node1', prompt: 'First.' },
+        { id: 'node2', prompt: 'Second.', depends_on: ['node1'] },
+      ],
+    });
+
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'failed',
+        workflowSource: 'bundled',
+        exitReason: 'node_error',
+      })
+    );
   });
 });

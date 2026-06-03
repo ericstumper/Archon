@@ -295,6 +295,11 @@ export async function workflowRunCommand(
   const workflows = workflowEntries.map(ws => ws.workflow);
 
   const workflow = resolveWorkflowName(workflowName, workflows);
+  // Recover the discovery source (dropped by the .map above) for telemetry —
+  // bundled workflows report their real name, custom ones report "custom".
+  const workflowSource = workflow
+    ? workflowEntries.find(ws => ws.workflow === workflow)?.source
+    : undefined;
 
   if (!workflow) {
     // Check if the requested workflow had a load error
@@ -653,8 +658,10 @@ export async function workflowRunCommand(
   adapter.setConversationDbId(conversationId, conversation.id);
 
   // Persist user message for Web UI history.
-  // TODO: thread userId once the CLI auth path lands (`archon auth github`
-  // resolving via ~/.archon/config.yaml `user_id`).
+  // TODO: thread the CLI user id (resolveCliUserId() in commands/auth.ts —
+  // ARCHON_USER_ID / $USER) through to addMessage and executeWorkflow so CLI
+  // runs are attributed. `archon auth github` has landed; this is the remaining
+  // wiring.
   try {
     await messageDb.addMessage(conversation.id, 'user', userMessage);
   } catch (error) {
@@ -786,8 +793,8 @@ export async function workflowRunCommand(
   let result: Awaited<ReturnType<typeof executeWorkflow>>;
   try {
     const opts = prepared
-      ? { codebaseId: codebase?.id, ...prepared }
-      : { codebaseId: codebase?.id };
+      ? { codebaseId: codebase?.id, source: workflowSource, ...prepared }
+      : { codebaseId: codebase?.id, source: workflowSource };
     result = await executeWorkflow(
       deps,
       adapter,

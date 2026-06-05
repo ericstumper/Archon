@@ -11,6 +11,7 @@ export type {
   ProviderInfo,
   MessageChunk,
   TokenUsage,
+  NativeTool,
 } from './types';
 
 // Provider config types (canonical definitions in ./types, re-exported via config modules)
@@ -75,6 +76,13 @@ export {
   resetCopilotSingleton,
   type CopilotProviderDefaults,
 } from './community/copilot';
+export {
+  OMP_CAPABILITIES,
+  OmpProvider,
+  parseOmpConfig,
+  registerOmpProvider,
+  type OmpProviderDefaults,
+} from './community/omp';
 export {
   resolveCopilotBinaryPath,
   fileExists as copilotFileExists,

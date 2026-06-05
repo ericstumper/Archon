@@ -3,6 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createLogger } from '@archon/paths';
+// Type-only import — erased by TS, so it does NOT trigger Pi's config.js
+// package.json read at module load (see the header note below). Used only to
+// annotate the per-call ResourceLoader local.
+import type { DefaultResourceLoader } from '@earendil-works/pi-coding-agent';
 
 import type {
   IAgentProvider,
@@ -176,10 +180,11 @@ export class PiProvider implements IAgentProvider {
     const [
       piCodingAgent,
       { bridgeSession },
-      { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools },
-      { createNoopResourceLoader },
+      { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools, buildDefaultPiTools },
+      { createNoopResourceLoader, getOrCreateReloadedExtensionLoader },
       { resolvePiSession },
       { createArchonUIBridge, createArchonUIContext },
+      { buildPiNativeToolDefinitions },
     ] = await Promise.all([
       import('@earendil-works/pi-coding-agent'),
       import('./event-bridge'),
@@ -187,6 +192,7 @@ export class PiProvider implements IAgentProvider {
       import('./resource-loader'),
       import('./session-resolver'),
       import('./ui-context-stub'),
+      import('./native-tools'),
     ]);
     const { createAgentSession } = piCodingAgent;
 
@@ -435,18 +441,21 @@ export class PiProvider implements IAgentProvider {
     const enableExtensions = piConfig.enableExtensions !== false;
     // Clamp to false without extensions: nothing consumes hasUI without a runner.
     const interactive = enableExtensions && piConfig.interactive !== false;
-    const resourceLoader = createNoopResourceLoader(cwd, {
+
+    // Build the ResourceLoader. When extensions are ON we MUST reuse a
+    // process-cached, already-reloaded loader: Pi's `reload()` re-invokes every
+    // installed extension factory from scratch and the 2nd reload in a process
+    // deadlocks on the first call's never-torn-down state (issue #1877 — see the
+    // doc on getOrCreateReloadedExtensionLoader). When extensions are OFF there
+    // is no reload() and thus no re-entrancy hazard, so a fresh per-call loader
+    // is fine. Build the shared options once so the two paths can't drift.
+    const loaderOptions = {
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
-      ...(enableExtensions ? { enableExtensions: true } : {}),
-    });
-
-    // Required: without reload(), session.extensionRunner is undefined and
-    // setFlagValue silently no-ops. createAgentSession skips this when a
-    // custom resource loader is supplied.
-    if (enableExtensions) {
-      await resourceLoader.reload();
-    }
+    };
+    const resourceLoader: DefaultResourceLoader = enableExtensions
+      ? await getOrCreateReloadedExtensionLoader(cwd, loaderOptions)
+      : createNoopResourceLoader(cwd, loaderOptions);
 
     getLog().info(
       {
@@ -464,6 +473,19 @@ export class PiProvider implements IAgentProvider {
       },
       'pi.session_started'
     );
+
+    // In-process native tools (e.g. manage_run) via Pi customTools. Because
+    // setting customTools forces noTools:'builtin' (dropping Pi's defaults), the
+    // base tool set must be re-supplied alongside the native defs.
+    const nativeToolDefs =
+      requestOptions?.nativeTools && requestOptions.nativeTools.length > 0
+        ? buildPiNativeToolDefinitions(requestOptions.nativeTools)
+        : [];
+    const baseTools =
+      filteredTools ??
+      (nativeToolDefs.length > 0 ? buildDefaultPiTools(cwd, requestOptions?.env) : undefined);
+    const piCustomTools =
+      nativeToolDefs.length > 0 ? [...(baseTools ?? []), ...nativeToolDefs] : filteredTools;
 
     const { session, modelFallbackMessage } = await createAgentSession({
       cwd,
@@ -489,8 +511,8 @@ export class PiProvider implements IAgentProvider {
       // pre-constructed without a spawnHook (see resolvePiTools in
       // options-translator.ts), so the env-aware bash MUST go through
       // customTools, not just for tool restriction.
-      ...(filteredTools !== undefined
-        ? { customTools: filteredTools, noTools: 'builtin' as const }
+      ...(piCustomTools !== undefined
+        ? { customTools: piCustomTools, noTools: 'builtin' as const }
         : {}),
     });
 

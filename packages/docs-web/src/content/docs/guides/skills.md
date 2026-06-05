@@ -13,7 +13,7 @@ DAG workflow nodes support a `skills` field that preloads named skills into the
 node's agent context. Each node gets specialized procedural knowledge — code review
 patterns, Remotion best practices, testing conventions — without polluting other nodes.
 
-**Supported on Claude, Pi, and Oh My Pi** — Codex nodes will warn and ignore the `skills` field.
+**Supported on Claude, Codex, Pi, and Oh My Pi.** Claude injects per-node skills via the SDK's `AgentDefinition.skills` field (only listed skills are loaded for that node). Codex auto-discovers skills from the filesystem (`.agents/skills/`), so every installed skill is available on every Codex node — the YAML `skills:` list is informational for Codex. Pi and Oh My Pi use their native skill discovery/runtime.
 
 ## Quick Start
 
@@ -172,6 +172,7 @@ smaller box with a tastefully curated set of tools."
 | Skill | Install | What It Teaches |
 |-------|---------|----------------|
 | `archon` (bundled) | `archon skill install` | Archon workflows, commands, and project conventions |
+| `manage-run` (bundled) | `archon skill install` | Inspect and control workflow runs via the `archon` CLI (focused run-management skill) |
 | `remotion-best-practices` | `npx skills add remotion-dev/skills` | Remotion animation patterns, API usage, gotchas (35 rules) |
 | `skill-creator` | `npx skills add anthropics/skills` | How to create new SKILL.md files |
 | Community skills | Browse [skills.sh](https://skills.sh) | Search 500K+ skills for any domain |
@@ -210,21 +211,35 @@ produce better results than either alone.
 
 ## Codex Compatibility
 
-Codex nodes with `skills` log a warning and continue without the skills:
+Codex supports skills via filesystem auto-discovery from `<project>/.agents/skills/`
+(its canonical project-level skill path). After running `archon skill install` —
+or `archon setup`, which installs them automatically — both Claude Code and
+Codex pick up the bundled `archon` and `manage-run` skills with no further setup.
 
-```
-Warning: Node 'review' has skills set but uses Codex — per-node skills
-are not supported for Codex.
-```
+Important differences vs Claude:
 
-To use skills, ensure the node uses a provider with skill support (`claude`, `pi`,
-or `omp`).
+- **Auto-discovery, not per-node injection** — Codex loads every skill present
+  under `.agents/skills/`. The `skills:` list in YAML is informational for
+  Codex nodes; Codex does not scope skills per node.
+- **No SDK-level skill activation** — Archon does not pass `skills:` to the
+  Codex SDK. Skills work entirely through filesystem discovery.
+- **SKILL.md format** — Codex parses the same `name`/`description` frontmatter
+  as Claude Code. Any Claude-specific `!bash` execution lines in a skill body
+  are treated as literal text by Codex (no error, no execution).
+
+To opt out of a skill on Codex, remove it from `.agents/skills/`. To force
+per-node scoping, use `provider: claude` on the node — Claude honors the
+`skills:` list strictly. Pi and Oh My Pi use their native skill runtimes.
 
 ## Limitations
 
 - **Pre-installation required** — skills must exist on disk before the workflow runs.
   There is no on-demand fetching (yet).
-- **Provider-specific runtime** — Claude uses `AgentDefinition.skills`; Pi and Oh My Pi use their native skill discovery/runtime.
+- **Provider-specific runtime** — Claude honors the YAML `skills:` list via
+  the SDK's `AgentDefinition.skills` field. Codex auto-discovers all installed
+  skills from `.agents/skills/`; for Codex the `skills:` list is informational
+  and every installed skill is available on every node. Pi and Oh My Pi use
+  their native skill discovery/runtime.
 - **Full injection** — skill content is fully injected at startup, not progressively
   disclosed. Keep skills concise.
 - **No validation** — if a named skill doesn't exist, the SDK may fail silently.
@@ -234,8 +249,8 @@ or `omp`).
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| Skill not found | Not installed | Run `npx skills add <source>` |
-| Skill ignored | Node uses Codex provider | Set `provider:` to `claude`, `pi`, or `omp` on the node |
+| Skill not found | Not installed | Run `npx skills add <source>` (or `archon skill install` for the bundled Archon skills) |
+| Skill loads on wrong node | Codex auto-discovers all installed skills; the `skills:` list is informational for Codex | Use `provider: claude`, `pi`, or `omp` to scope per-node/native skill behavior, or remove the skill from `.agents/skills/` |
 | Too many skills | Context budget exceeded | Reduce to 2-3 most relevant skills per node |
 | Skill has no effect | Description too vague | Rewrite SKILL.md with specific, actionable instructions |
 

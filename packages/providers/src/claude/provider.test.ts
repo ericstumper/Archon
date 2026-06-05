@@ -168,13 +168,14 @@ describe('ClaudeProvider', () => {
         skills: true,
         agents: true,
         toolRestrictions: true,
-        structuredOutput: true,
+        structuredOutput: 'enforced',
         envInjection: true,
         costControl: true,
         effortControl: true,
         thinkingControl: true,
         fallbackModel: true,
         sandbox: true,
+        nativeTools: true,
       });
     });
   });

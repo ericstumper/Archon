@@ -334,7 +334,9 @@ async function buildSessionConfig(
     model: resolvedModel,
     reasoningEffort: reasoning.effort,
     workingDirectory: cwd,
-    configDir: copilotConfig.configDir,
+    // SessionConfig.configDirectory only scopes session config/state; the
+    // runtime home that logged-in auth reads from is set on CopilotClientOptions.
+    configDirectory: copilotConfig.configDir,
     streaming: true,
     systemMessage: resolveSystemMessage(requestOptions),
     enableConfigDiscovery: copilotConfig.enableConfigDiscovery ?? false,
@@ -466,7 +468,11 @@ export class CopilotProvider implements IAgentProvider {
     const cliPath = await resolveCopilotBinaryPath(copilotConfig.copilotCliPath);
 
     const sdk = await import('@github/copilot-sdk');
-    const { CopilotClient: copilotClientCtor, approveAll } = sdk;
+    const {
+      CopilotClient: copilotClientCtor,
+      RuntimeConnection: runtimeConnection,
+      approveAll,
+    } = sdk;
 
     const warnings: ProviderWarning[] = [];
     const sessionConfig = await buildSessionConfig(
@@ -494,19 +500,20 @@ export class CopilotProvider implements IAgentProvider {
       : prompt;
 
     const clientOpts: CopilotClientOptions = {
-      cwd,
+      workingDirectory: cwd,
       env: mergedEnv,
     };
-    if (cliPath) clientOpts.cliPath = cliPath;
+    if (copilotConfig.configDir) clientOpts.baseDirectory = copilotConfig.configDir;
+    if (cliPath) clientOpts.connection = runtimeConnection.forStdio({ path: cliPath });
     // Auth precedence: see COPILOT_TOKEN_ENV_KEY / GENERIC_GITHUB_TOKEN_ENV_KEYS docs.
     let tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
     if (copilotToken) {
-      clientOpts.githubToken = copilotToken;
+      clientOpts.gitHubToken = copilotToken;
       clientOpts.useLoggedInUser = false;
       tokenSource = 'copilot-token';
     } else if (copilotConfig.useLoggedInUser === false) {
       if (genericGithubToken) {
-        clientOpts.githubToken = genericGithubToken;
+        clientOpts.gitHubToken = genericGithubToken;
         tokenSource = 'generic-token';
       } else {
         tokenSource = 'logged-in-user';

@@ -518,7 +518,8 @@ Archon bundles the OMP SDK packages through `@archon/providers`; no separate npm
 
 Authentication follows the OMP provider's native options:
 
-- API-key providers: set the provider env var in the shell, Archon env file, workflow/codebase `envVars`, or `assistants.omp.env`. Examples: `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`.
+- API-key providers: set the provider env var in the shell, Archon env file, workflow/codebase `envVars`, or `assistants.omp.env`. Examples: `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `AZURE_OPENAI_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`.
+- Anthropic subscriptions in direct chat: OMP reads `ANTHROPIC_OAUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` before `ANTHROPIC_API_KEY`, so a connected Claude Pro/Max subscription wins over a fallback API key for anthropic models.
 - OAuth providers: complete the upstream OMP login flow so credentials are stored in the OMP agent directory (`agentDir` below, or OMP's default).
 - Local inference: configure the upstream OMP model/provider registry for local backends such as Ollama, LM Studio, llama.cpp, or custom OpenAI-compatible endpoints, and provide the env var OMP expects for that provider when it requires one (for example `OLLAMA_API_KEY`, `LM_STUDIO_API_KEY`, `LLAMA_CPP_API_KEY`, or the custom provider's configured credential).
 
@@ -731,6 +732,64 @@ DEFAULT_AI_ASSISTANT=copilot
 - [Adding a Community Provider](../contributing/adding-a-community-provider/) — the contributor-facing guide for extending Archon with your own provider.
 - [`@github/copilot-sdk`](https://www.npmjs.com/package/@github/copilot-sdk) — upstream SDK.
 
+## Per-user credentials and AI Settings
+
+Everything above configures the **install-wide** assistant credentials (env vars, `claude /login`, etc.) — every run uses the same shared keys. On a **shared Archon box** where several people use the same server, each user can instead connect **their own** provider — by API key or subscription — so their runs and chats bill to them, not to the install's shared key.
+
+### When you need this
+
+- You run Archon for a team and want each person to bring their own provider key or Claude Pro/Max / Copilot subscription.
+- You want a personal key isolated from the shared install key.
+
+Solo users don't need any of this — the install-wide setup above is enough.
+
+### Enabling it
+
+Per-user credentials are gated on a single secret. Set `TOKEN_ENCRYPTION_KEY` (a 64-char hex string) so Archon can encrypt stored credentials at rest (AES-256-GCM):
+
+```ini
+# .env — generate with: openssl rand -hex 32
+TOKEN_ENCRYPTION_KEY=<64-char hex>
+```
+
+Without it, the per-user surface is inert (the routes report `enabled: false`) and Archon keeps reading provider keys from the environment as above. The console's **Agents** section still renders in that state — agents with static credential metadata show install-level status (which keys the server environment already carries, plus ambient cloud-chain detection) with the connect/login/disconnect affordances hidden, so a solo install can see *what's authenticated* even though there's nothing per-user to manage. Dynamic agents such as Oh My Pi rely on their own runtime credential/catalog discovery and do not expose nested credential readiness in the Archon card.
+
+### Connecting from the console
+
+The console **AI Settings** page (Settings in the web UI) has four sections:
+
+- **Model Tiers** — map the `small` / `medium` / `large` tiers to a provider + model (and optional effort). This writes the install's `tiers:` config and works on **any** install, even without `TOKEN_ENCRYPTION_KEY` (it's non-secret config). Pi tier models show a cost/reasoning/context hint from Pi's model catalog.
+- **Model Aliases** — define `@custom` refs (e.g. `@fast`) usable in workflow `model:` fields, with the same scope toggle.
+- **Agents** — one card per agent (Claude Code, Codex, Pi, Oh My Pi, OpenCode, Copilot). Agents with static credential metadata show the credentials they can spend nested inside, each with a readiness state (ready / needs credential). Connect a credential for *your* user inside the agent that uses it. Credentials are keyed by **vendor** (`anthropic`, `openai`, `github-copilot`, `openrouter`, …), and one credential serves every static agent that consumes it (for example, an `anthropic` key powers Claude Code and Pi's anthropic backend, so both static cards reflect it). Oh My Pi is dynamic: its provider/model universe and credential checks come from the OMP runtime, so its Archon card does not mirror per-vendor credential readiness. Every static vendor accepts an **API key**; **`anthropic`**, **`openai`**, and **`github-copilot`** additionally offer **subscription login** (an OAuth flow — for `openai`/ChatGPT it is an Archon-owned PKCE flow where you paste the redirect URL or code back, [#1924](https://github.com/coleam00/Archon/issues/1924)).
+- **Defaults** — the default assistant and per-provider model defaults, plus a "Your default" (just-me) assistant select.
+
+### Per-user model preferences ("Just me")
+
+When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a "Your default" select. The "Just me" scope stores your personal tiers/aliases/default assistant in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
+
+If a chat asks for the `large` tier and only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set `large`.
+
+### Connecting from the CLI
+
+The same actions are available headless via [`archon ai`](/reference/cli/#ai):
+
+```bash
+# Per-user credentials (need TOKEN_ENCRYPTION_KEY)
+echo "$MY_KEY" | archon ai key set openrouter   # API key for any vendor
+archon ai login anthropic                        # subscription (anthropic, openai, or github-copilot)
+archon ai list                                   # what's connected
+
+# Model tiers + aliases + default (ungated config — solo-OK)
+archon ai tier set large claude opus
+archon ai alias set @fast claude haiku
+archon ai default claude
+
+# The same, but just for YOU (per-user prefs; identity from ARCHON_USER_ID/$USER)
+archon ai tier set large claude opus --scope user
+archon ai default codex --scope user
+```
+
+The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 ## How Assistant Selection Works
 
 - Assistant type is set per codebase via the `assistant` field in `.archon/config.yaml` or the `DEFAULT_AI_ASSISTANT` env var

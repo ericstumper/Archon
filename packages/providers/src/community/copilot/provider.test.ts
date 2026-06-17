@@ -113,9 +113,13 @@ class FakeCopilotClient {
 
 // Capture the onPermissionRequest passed into createSession.
 const approveAllStub = mock(() => ({ kind: 'approved' }));
+const runtimeConnectionForStdio = mock((opts?: { path?: string }) => ({ kind: 'stdio', ...opts }));
 
 mock.module('@github/copilot-sdk', () => ({
   CopilotClient: FakeCopilotClient,
+  RuntimeConnection: {
+    forStdio: runtimeConnectionForStdio,
+  },
   approveAll: approveAllStub,
 }));
 
@@ -462,8 +466,33 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    expect(lastClientOpts?.githubToken).toBeUndefined();
+    expect(lastClientOpts?.gitHubToken).toBeUndefined();
     expect(lastClientOpts?.useLoggedInUser).toBe(true);
+    // Client process starts in the request cwd; session tools also receive
+    // workingDirectory in createSession.
+    expect(lastClientOpts?.workingDirectory).toBe('/w');
+    // Dev mode resolves no custom CLI binary → SDK uses bundled/default CLI.
+    expect(lastClientOpts?.connection).toBeUndefined();
+  });
+
+  test('configDir override sets Copilot client baseDirectory', async () => {
+    const session = makeFakeSession();
+    nextCreateSessionResult = session;
+
+    const p = new CopilotProvider();
+    const gen = p.sendQuery('hi', '/w', undefined, {
+      model: 'gpt-5',
+      assistantConfig: { configDir: '/custom/copilot-home' },
+    });
+    const first = gen.next();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    session.resolveSend(undefined);
+    await first;
+    await collect(gen);
+
+    expect(lastClientOpts?.baseDirectory).toBe('/custom/copilot-home');
+    const opts = createSessionSpy.mock.calls[0]![0] as { configDirectory?: string };
+    expect(opts.configDirectory).toBe('/custom/copilot-home');
   });
 
   test('COPILOT_GITHUB_TOKEN is always used (intent signal)', async () => {
@@ -481,7 +510,7 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    expect(lastClientOpts?.githubToken).toBe('ghp_copilot');
+    expect(lastClientOpts?.gitHubToken).toBe('ghp_copilot');
     expect(lastClientOpts?.useLoggedInUser).toBe(false);
   });
 
@@ -501,7 +530,7 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    expect(lastClientOpts?.githubToken).toBe('ghp_testtoken');
+    expect(lastClientOpts?.gitHubToken).toBe('ghp_testtoken');
     expect(lastClientOpts?.useLoggedInUser).toBe(false);
   });
 
@@ -521,7 +550,7 @@ describe('CopilotProvider.sendQuery', () => {
     await first;
     await collect(gen);
 
-    expect(lastClientOpts?.githubToken).toBeUndefined();
+    expect(lastClientOpts?.gitHubToken).toBeUndefined();
     expect(lastClientOpts?.useLoggedInUser).toBe(true);
   });
 

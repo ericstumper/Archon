@@ -11,7 +11,6 @@ export type {
   ProviderInfo,
   MessageChunk,
   TokenUsage,
-  NativeTool,
   CredentialKind,
   CredentialSpec,
   ProviderCredentialCatalog,

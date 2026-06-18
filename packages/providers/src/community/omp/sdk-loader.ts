@@ -63,6 +63,26 @@ export interface OmpExtensionApi {
 
 export type OmpExtensionFactory = (api: OmpExtensionApi) => void | Promise<void>;
 
+export interface OmpCustomToolResult {
+  content: { type: 'text'; text: string }[];
+  details?: unknown;
+  isError?: boolean;
+}
+
+export interface OmpCustomTool {
+  name: string;
+  label: string;
+  description: string;
+  parameters: unknown;
+  execute(
+    toolCallId: string,
+    params: Record<string, unknown>,
+    onUpdate?: unknown,
+    context?: unknown,
+    signal?: AbortSignal
+  ): Promise<OmpCustomToolResult>;
+}
+
 export interface OmpSession {
   sessionId?: string;
   extensionRunner?: OmpExtensionRunner;
@@ -93,10 +113,12 @@ export interface OmpCreateAgentSessionOptions {
   disableExtensionDiscovery?: boolean;
   additionalExtensionPaths?: string[];
   extensions?: OmpExtensionFactory[];
+  spawns?: string;
   thinkingLevel?: string;
   systemPrompt?: string[] | ((defaultPrompt: string[]) => string[]);
   mcpManager?: OmpMcpManager;
   customTools?: unknown[];
+  deadline?: number;
   toolNames: string[];
   hasUI: boolean;
 }

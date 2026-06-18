@@ -1,4 +1,7 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import { createMockLogger } from '../test/mocks/logger';
 import { makeTestWorkflow, makeTestWorkflowList } from '@archon/workflows/test-utils';
@@ -10,10 +13,13 @@ import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
+  captureApprovalResolved: () => undefined,
   createLogger: mock(() => mockLogger),
   getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
   ensureArchonWorkspacesPath: mock(() => Promise.resolve('/home/test/.archon/workspaces')),
   getArchonHome: mock(() => '/home/test/.archon'),
+  captureChatTurn: mock(() => undefined),
+  captureCodebaseRegistered: mock(() => undefined),
 }));
 
 // DB mocks
@@ -101,6 +107,10 @@ const mockGetProviderCapabilities = mock(() => ({
 mock.module('@archon/providers', () => ({
   getAgentProvider: mockGetAgentProvider,
   getProviderCapabilities: mockGetProviderCapabilities,
+  getRegisteredProviders: mock(() => []),
+  // credentials/delivery (#1955) imports these from '@archon/providers'.
+  PI_PROVIDER_ENV_VARS: { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY' },
+  PI_AMBIENT_VENDORS: ['amazon-bedrock', 'google-vertex'],
 }));
 
 // Workflow mocks
@@ -1477,12 +1487,48 @@ describe('orchestrator-agent handleMessage', () => {
       expect(mockCreateCodebase).toHaveBeenCalledWith({
         name: 'my-app',
         default_cwd: '/home/user/my-app',
+        default_branch: null,
         ai_assistant_type: 'claude',
       });
       expect(platform.sendMessage).toHaveBeenCalledWith(
         'chat-456',
         expect.stringContaining('registered successfully')
       );
+    });
+
+    test('/register-project stores detected current branch', async () => {
+      const projectPath = await mkdtemp(join(tmpdir(), 'archon-register-project-'));
+      try {
+        await Bun.spawn(['git', 'init', '-b', 'develop'], { cwd: projectPath }).exited;
+        await Bun.spawn(['git', 'commit', '--allow-empty', '-m', 'init'], {
+          cwd: projectPath,
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'Archon Test',
+            GIT_AUTHOR_EMAIL: 'archon-test@example.com',
+            GIT_COMMITTER_NAME: 'Archon Test',
+            GIT_COMMITTER_EMAIL: 'archon-test@example.com',
+          },
+        }).exited;
+        mockExistsSync.mockReturnValue(true);
+        mockListCodebases.mockResolvedValue([]);
+        mockCreateCodebase.mockResolvedValue({
+          id: 'new-id',
+          name: 'my-app',
+          default_cwd: projectPath,
+        });
+
+        await handleMessage(platform, 'chat-456', `/register-project my-app ${projectPath}`);
+
+        expect(mockCreateCodebase).toHaveBeenCalledWith({
+          name: 'my-app',
+          default_cwd: projectPath,
+          default_branch: 'develop',
+          ai_assistant_type: 'claude',
+        });
+      } finally {
+        await rm(projectPath, { recursive: true, force: true });
+      }
     });
 
     test('/register-project rejects non-existent path', async () => {

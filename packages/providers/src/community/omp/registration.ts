@@ -12,5 +12,6 @@ export function registerOmpProvider(): void {
     factory: () => new OmpProvider(),
     capabilities: OMP_CAPABILITIES,
     builtIn: false,
+    credentials: { kind: 'dynamic' },
   });
 }

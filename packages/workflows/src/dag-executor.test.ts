@@ -4947,9 +4947,88 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       // Verify the prompt contains the user input
       const promptArg = mockSendQueryDag.mock.calls[0][0] as string;
       expect(promptArg).toContain('Add error handling');
-      // Should have resumed with stored session ID
+      // Should use a fresh session on the first resumed iteration: the stored
+      // gate session may have expired during the human review wait, so we
+      // start fresh (user feedback is carried via $LOOP_USER_INPUT). See
+      // packages/workflows/src/dag-executor.ts needsFreshSession (#1208).
       const sessionArg = mockSendQueryDag.mock.calls[0][2] as string | undefined;
-      expect(sessionArg).toBe('loop-session-1');
+      expect(sessionArg).toBeUndefined();
+    });
+
+    it('interactive loop resume does not crash with error_during_execution on iteration 2', async () => {
+      // Regression test for #1208: when resuming a paused interactive loop
+      // gate, the first resumed iteration must use a fresh session (not the
+      // potentially stale stored session id), so the SDK never receives an
+      // expired session id that would trigger error_during_execution.
+      mockSendQueryDag.mockImplementation(function* () {
+        yield {
+          type: 'assistant',
+          content: 'Updated plan with error handling. <promise>APPROVED</promise>',
+        };
+        yield { type: 'result', sessionId: 'fresh-session-1' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      // Simulate resumed run: metadata has loop gate state from iteration 1
+      // with a stale session id (the SDK would reject this if reused).
+      const workflowRun = makeWorkflowRun('resume-no-crash-id', {
+        metadata: {
+          approval: {
+            type: 'interactive_loop',
+            nodeId: 'refine',
+            iteration: 1,
+            sessionId: 'stale-session-from-hours-ago',
+            message: 'Review the plan.',
+          },
+          loop_user_input: 'Add error handling',
+        },
+      });
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'interactive-loop-no-crash',
+          nodes: [
+            {
+              id: 'refine',
+              loop: {
+                prompt: 'User said: $LOOP_USER_INPUT. Refine the plan.',
+                until: 'APPROVED',
+                max_iterations: 10,
+                interactive: true,
+                gate_message: 'Review the plan.',
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Exactly one iteration runs (it completes via APPROVED signal)
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      // Crucially: sessionArg must be undefined (fresh session), NOT the stale stored id.
+      const sessionArg = mockSendQueryDag.mock.calls[0][2] as string | undefined;
+      expect(sessionArg).toBeUndefined();
+
+      // No failure events were emitted (no loop_iteration_failed, no node_failed).
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedEvents = eventCalls.filter((call: unknown[]) => {
+        const evt = (call[0] as Record<string, unknown>).event_type as string;
+        return evt === 'loop_iteration_failed' || evt === 'node_failed';
+      });
+      expect(failedEvents).toHaveLength(0);
     });
 
     it('loop iteration fails loudly when SDK returns error_during_execution', async () => {
@@ -9357,6 +9436,62 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         nodesTotal: 1,
       })
     );
+    // No node reported usage — the fields must be OMITTED, not sent as zero.
+    const captured = mockCaptureWorkflowCompleted.mock.calls[0][0] as Record<string, unknown>;
+    expect('costUsd' in captured).toBe(false);
+    expect('tokensIn' in captured).toBe(false);
+    expect('tokensOut' in captured).toBe(false);
+    expect('loopIterations' in captured).toBe(false);
+  });
+
+  it('threads provider-reported cost and tokens into the completion telemetry', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: 'sid-usage',
+        cost: 0.25,
+        tokens: { input: 5000, output: 1200 },
+      };
+    });
+
+    await runDag({ name: 'dag-usage', nodes: [{ id: 'step', prompt: 'Do thing.' }] });
+
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledTimes(1);
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'completed',
+        costUsd: 0.25,
+        tokensIn: 5000,
+        tokensOut: 1200,
+      })
+    );
+  });
+
+  it('ignores non-finite token values without poisoning the run totals', async () => {
+    let call = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      call++;
+      yield { type: 'assistant', content: `ok ${call}` };
+      if (call === 1) {
+        // Misbehaving provider: NaN tokens must be ignored (and warned), not summed.
+        yield { type: 'result', sessionId: 'sid-bad', tokens: { input: NaN, output: 100 } };
+      } else {
+        yield { type: 'result', sessionId: 'sid-good', tokens: { input: 700, output: 50 } };
+      }
+    });
+
+    await runDag({
+      name: 'dag-nan',
+      nodes: [
+        { id: 'node1', prompt: 'First.' },
+        { id: 'node2', prompt: 'Second.', depends_on: ['node1'] },
+      ],
+    });
+
+    expect(mockCaptureWorkflowCompleted).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: 'completed', tokensIn: 700, tokensOut: 50 })
+    );
   });
 
   it('emits outcome=failed exit_reason=no_nodes_completed when the only node fails', async () => {
@@ -9374,6 +9509,10 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         outcome: 'failed',
         workflowSource: 'bundled',
         exitReason: 'no_nodes_completed',
+        // Failure taxonomy: "produced no assistant output" matches no fatal/
+        // transient pattern → unknown; the failing node is a prompt node.
+        errorClass: 'unknown',
+        failedNodeType: 'prompt',
       })
     );
   });
@@ -9406,6 +9545,8 @@ describe('executeDagWorkflow -- completion telemetry', () => {
         outcome: 'failed',
         workflowSource: 'bundled',
         exitReason: 'node_error',
+        errorClass: 'unknown',
+        failedNodeType: 'prompt',
       })
     );
   });

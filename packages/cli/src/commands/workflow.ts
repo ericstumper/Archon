@@ -21,7 +21,12 @@ import {
   getWorkflowEventEmitter,
   type WorkflowEmitterEvent,
 } from '@archon/workflows/event-emitter';
-import type { WorkflowDefinition, WorkflowLoadResult } from '@archon/workflows/schemas/workflow';
+import type {
+  WorkflowDefinition,
+  WorkflowLoadResult,
+  WorkflowSource,
+  WorkflowWithSource,
+} from '@archon/workflows/schemas/workflow';
 import { workflowRunStatusSchema } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun, WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import {
@@ -39,8 +44,10 @@ import * as messageDb from '@archon/core/db/messages';
 import * as workflowDb from '@archon/core/db/workflows';
 import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import type { WorkflowEventRow } from '@archon/core/db/workflow-events';
+import * as userDb from '@archon/core/db/users';
 import * as git from '@archon/git';
 import { CLIAdapter } from '../adapters/cli-adapter';
+import { resolveCliUserId } from './auth';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -314,6 +321,18 @@ async function loadWorkflows(cwd: string): Promise<WorkflowLoadResult> {
   }
 }
 
+function countWorkflowSources(
+  workflows: readonly WorkflowWithSource[]
+): Record<WorkflowSource, number> {
+  return workflows.reduce<Record<WorkflowSource, number>>(
+    (counts, entry) => {
+      counts[entry.source] += 1;
+      return counts;
+    },
+    { bundled: 0, global: 0, project: 0 }
+  );
+}
+
 interface WorkflowJsonEntry {
   name: string;
   description: string;
@@ -392,7 +411,17 @@ export async function workflowRunCommand(
   userMessage: string,
   options: WorkflowRunOptions = {}
 ): Promise<void> {
-  const { workflows: workflowEntries, errors } = await loadWorkflows(options.discoveryCwd ?? cwd);
+  const effectiveDiscoveryCwd = options.discoveryCwd ?? cwd;
+  const { workflows: workflowEntries, errors } = await loadWorkflows(effectiveDiscoveryCwd);
+  const sourceCounts = countWorkflowSources(workflowEntries);
+
+  if (!options.json && !options.quiet) {
+    console.log(
+      `Discovery: root=${effectiveDiscoveryCwd} workflows=${String(workflowEntries.length)} ` +
+        `bundled=${String(sourceCounts.bundled)} global=${String(sourceCounts.global)} ` +
+        `project=${String(sourceCounts.project)}`
+    );
+  }
 
   if (workflowEntries.length === 0 && errors.length === 0) {
     throw new Error('No workflows found in .archon/workflows/');
@@ -810,13 +839,25 @@ export async function workflowRunCommand(
   // Wire adapter for assistant message persistence
   adapter.setConversationDbId(conversationId, conversation.id);
 
+  // Resolve the CLI user once (ARCHON_USER_ID, else $USER/$USERNAME). When set,
+  // upsert via the `cli` platform identity so the same Archon user is reused
+  // across invocations — this is what attributes the workflow run to the human
+  // running the command and what `getUserProviderEnv` keys on for per-user
+  // AI-provider credentials (#1891 Phase 2).
+  const cliId = resolveCliUserId();
+  let cliUserId: string | undefined;
+  if (cliId) {
+    try {
+      const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+      cliUserId = cliUser.id;
+    } catch (error) {
+      getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
+    }
+  }
+
   // Persist user message for Web UI history.
-  // TODO: thread the CLI user id (resolveCliUserId() in commands/auth.ts —
-  // ARCHON_USER_ID / $USER) through to addMessage and executeWorkflow so CLI
-  // runs are attributed. `archon auth github` has landed; this is the remaining
-  // wiring.
   try {
-    await messageDb.addMessage(conversation.id, 'user', userMessage);
+    await messageDb.addMessage(conversation.id, 'user', userMessage, undefined, cliUserId);
   } catch (error) {
     getLog().warn(
       { err: error as Error, conversationId: conversation.id },
@@ -946,8 +987,8 @@ export async function workflowRunCommand(
   let result: Awaited<ReturnType<typeof executeWorkflow>>;
   try {
     const opts = prepared
-      ? { codebaseId: codebase?.id, source: workflowSource, ...prepared }
-      : { codebaseId: codebase?.id, source: workflowSource };
+      ? { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId, ...prepared }
+      : { codebaseId: codebase?.id, source: workflowSource, userId: cliUserId };
     result = await executeWorkflow(
       deps,
       adapter,
@@ -1365,6 +1406,38 @@ function printJsonWriteError(runId: string, action: string, error: unknown): voi
   );
 }
 
+async function resolveDiscoveryCwdForCodebase(
+  runId: string,
+  codebaseId: string,
+  action: 'resume' | 'approve' | 'reject'
+): Promise<string> {
+  try {
+    const codebase = await codebaseDb.getCodebase(codebaseId);
+    if (!codebase) {
+      throw new Error(
+        `Workflow run '${runId}' references codebase '${codebaseId}', but that codebase no longer exists.\n` +
+          'Cannot safely discover workflows from the run worktree because project workflow files may be missing.\n' +
+          'Re-register the project or restore the codebase row, then retry.'
+      );
+    }
+    return codebase.default_cwd;
+  } catch (error) {
+    const err = error as Error;
+    if (err.message.includes('references codebase')) {
+      throw err;
+    }
+    getLog().error(
+      { err, errorType: err.constructor.name, runId, codebaseId },
+      `cli.workflow_${action}_codebase_lookup_failed`
+    );
+    throw new Error(
+      `Failed to load codebase '${codebaseId}' for workflow run '${runId}': ${err.message}\n` +
+        'Cannot safely discover workflows from the run worktree because project workflow files may be missing.\n' +
+        'Fix the codebase lookup problem, then retry.'
+    );
+  }
+}
+
 /**
  * Resume a failed workflow run by ID.
  *
@@ -1416,27 +1489,9 @@ export async function workflowResumeCommand(runId: string, json?: boolean): Prom
   // Use the codebase's source path for workflow YAML discovery so the file is
   // found even when working_path is a worktree or workspace clone that does
   // not contain the user's local (often untracked) workflow YAML.
-  let discoveryCwd: string | undefined;
-  if (run.codebase_id) {
-    try {
-      const codebase = await codebaseDb.getCodebase(run.codebase_id);
-      if (codebase) {
-        discoveryCwd = codebase.default_cwd;
-      } else {
-        getLog().warn(
-          { runId, codebaseId: run.codebase_id },
-          'cli.workflow_resume_codebase_not_found'
-        );
-      }
-    } catch (error) {
-      const err = error as Error;
-      getLog().warn(
-        { err, errorType: err.constructor.name, runId, codebaseId: run.codebase_id },
-        'cli.workflow_resume_codebase_lookup_failed'
-      );
-    }
-  }
-  if (discoveryCwd) console.log(`Discovery path: ${discoveryCwd}`);
+  const discoveryCwd = run.codebase_id
+    ? await resolveDiscoveryCwdForCodebase(runId, run.codebase_id, 'resume')
+    : undefined;
 
   // Re-execute via workflowRunCommand with --resume: it locates the prior failed
   // run via findResumableRun and skips already-completed nodes (the executor
@@ -1565,32 +1620,14 @@ export async function workflowApproveCommand(
     );
   }
 
-  // Use the codebase's source path for workflow YAML discovery so the file is
-  // found even when working_path is a worktree or workspace clone that does
-  // not contain the user's local (often untracked) workflow YAML.
-  let discoveryCwd: string | undefined;
-  if (result.codebaseId) {
-    try {
-      const codebase = await codebaseDb.getCodebase(result.codebaseId);
-      if (codebase) {
-        discoveryCwd = codebase.default_cwd;
-      } else {
-        getLog().warn(
-          { runId, codebaseId: result.codebaseId },
-          'cli.workflow_approve_codebase_not_found'
-        );
-      }
-    } catch (error) {
-      const err = error as Error;
-      getLog().warn(
-        { err, errorType: err.constructor.name, runId, codebaseId: result.codebaseId },
-        'cli.workflow_approve_codebase_lookup_failed'
-      );
-    }
-  }
-  if (discoveryCwd) console.log(`Discovery path: ${discoveryCwd}`);
-
   try {
+    // Use the codebase's source path for workflow YAML discovery so the file is
+    // found even when working_path is a worktree or workspace clone that does
+    // not contain the user's local (often untracked) workflow YAML.
+    const discoveryCwd = result.codebaseId
+      ? await resolveDiscoveryCwdForCodebase(runId, result.codebaseId, 'approve')
+      : undefined;
+
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       resume: true,
       codebaseId: result.codebaseId ?? undefined,
@@ -1685,32 +1722,14 @@ export async function workflowRejectCommand(
     );
   }
 
-  // Use the codebase's source path for workflow YAML discovery so the file is
-  // found even when working_path is a worktree or workspace clone that does
-  // not contain the user's local (often untracked) workflow YAML.
-  let discoveryCwd: string | undefined;
-  if (result.codebaseId) {
-    try {
-      const codebase = await codebaseDb.getCodebase(result.codebaseId);
-      if (codebase) {
-        discoveryCwd = codebase.default_cwd;
-      } else {
-        getLog().warn(
-          { runId, codebaseId: result.codebaseId },
-          'cli.workflow_reject_codebase_not_found'
-        );
-      }
-    } catch (error) {
-      const err = error as Error;
-      getLog().warn(
-        { err, errorType: err.constructor.name, runId, codebaseId: result.codebaseId },
-        'cli.workflow_reject_codebase_lookup_failed'
-      );
-    }
-  }
-  if (discoveryCwd) console.log(`Discovery path: ${discoveryCwd}`);
-
   try {
+    // Use the codebase's source path for workflow YAML discovery so the file is
+    // found even when working_path is a worktree or workspace clone that does
+    // not contain the user's local (often untracked) workflow YAML.
+    const discoveryCwd = result.codebaseId
+      ? await resolveDiscoveryCwdForCodebase(runId, result.codebaseId, 'reject')
+      : undefined;
+
     await workflowRunCommand(result.workingPath, result.workflowName, result.userMessage ?? '', {
       resume: true,
       codebaseId: result.codebaseId ?? undefined,

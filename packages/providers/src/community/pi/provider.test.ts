@@ -243,6 +243,8 @@ describe('PiProvider', () => {
     runtimeOverrides = {};
     delete process.env.GEMINI_API_KEY;
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_OAUTH_TOKEN;
+    delete process.env.ARCHON_PI_AUTH_PATH;
     // The extension-loader cache is module-level and persists across tests;
     // clear it so each test starts with an empty cache and sees its own
     // construct/reload calls (issue #1877).
@@ -337,6 +339,44 @@ describe('PiProvider', () => {
     expect(mockModelRegistryCreate).toHaveBeenCalledTimes(1);
     const authInstance = mockAuthCreate.mock.results[0]?.value;
     expect(mockModelRegistryCreate).toHaveBeenCalledWith(authInstance);
+  });
+
+  test('AuthStorage.create reads ARCHON_PI_AUTH_PATH from requestOptions.env (per-user channel)', async () => {
+    // The executor delivers per-user credentials — including the per-run
+    // auth.json PATH — on the per-call requestOptions.env channel, which it
+    // deliberately keeps OUT of process.env (subprocess-isolation). Pi runs
+    // in-process, so it must read the path from requestOptions.env or per-user
+    // subscription delivery silently no-ops (the auth.json is written but never
+    // loaded). Regression for the VPS smoke finding where a claude→anthropic
+    // subscription failed with "no credentials for provider 'anthropic'".
+    fileCreds.anthropic = { type: 'oauth' };
+    resetScript(scriptedAgentEnd());
+    const perRunAuthPath = '/run/abc123/pi-home/auth.json';
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+        env: { ARCHON_PI_AUTH_PATH: perRunAuthPath },
+      })
+    );
+
+    expect(mockAuthCreate).toHaveBeenCalledWith(perRunAuthPath);
+  });
+
+  test('AuthStorage.create falls back to process.env.ARCHON_PI_AUTH_PATH (shell override)', async () => {
+    // A shell-level ARCHON_PI_AUTH_PATH still applies when no per-call value is
+    // present, preserving the local-dev / manual override path.
+    fileCreds.anthropic = { type: 'oauth' };
+    resetScript(scriptedAgentEnd());
+    process.env.ARCHON_PI_AUTH_PATH = '/shell/override/auth.json';
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+      })
+    );
+
+    expect(mockAuthCreate).toHaveBeenCalledWith('/shell/override/auth.json');
   });
 
   test('AuthStorage.create() throwing surfaces a contextualized error', async () => {
@@ -550,6 +590,107 @@ describe('PiProvider', () => {
       })
     );
     expect(mockSetRuntimeApiKey).toHaveBeenCalledWith('anthropic', 'from-env');
+  });
+
+  test('ANTHROPIC_OAUTH_TOKEN (subscription) routes into setRuntimeApiKey for anthropic (#1984)', async () => {
+    // Env-only chat delivers a Claude Pro/Max subscription under the OAuth var.
+    // The bridge must read it (Pi never sees requestOptions.env via process.env),
+    // and the sk-ant-oat* bearer flows through the same runtime channel — pi-ai's
+    // createClient detects OAuth by token content downstream.
+    resetScript([
+      {
+        type: 'agent_end',
+        messages: [
+          {
+            role: 'assistant',
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: 'stop',
+            content: [],
+          },
+        ],
+      },
+    ]);
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+        env: { ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-bearer' },
+      })
+    );
+    expect(mockSetRuntimeApiKey).toHaveBeenCalledWith('anthropic', 'sk-ant-oat01-bearer');
+  });
+
+  test('OAuth var wins over the API-key var when both are delivered (#1984)', async () => {
+    resetScript([
+      {
+        type: 'agent_end',
+        messages: [
+          {
+            role: 'assistant',
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: 'stop',
+            content: [],
+          },
+        ],
+      },
+    ]);
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+        env: {
+          ANTHROPIC_OAUTH_TOKEN: 'sk-ant-oat01-bearer',
+          ANTHROPIC_API_KEY: 'sk-ant-apikey',
+        },
+      })
+    );
+    expect(mockSetRuntimeApiKey).toHaveBeenCalledWith('anthropic', 'sk-ant-oat01-bearer');
+  });
+
+  test('ANTHROPIC_OAUTH_TOKEN is read from process.env when absent from request env (#1984)', async () => {
+    // Shell/ambient override parity with the API-key var path.
+    process.env.ANTHROPIC_OAUTH_TOKEN = 'sk-ant-oat01-proc';
+    resetScript([
+      {
+        type: 'agent_end',
+        messages: [
+          {
+            role: 'assistant',
+            usage: {
+              input: 1,
+              output: 1,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: 'stop',
+            content: [],
+          },
+        ],
+      },
+    ]);
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'anthropic/claude-haiku-4-5',
+      })
+    );
+    expect(mockSetRuntimeApiKey).toHaveBeenCalledWith('anthropic', 'sk-ant-oat01-proc');
   });
 
   test('yields assistant chunks from text_delta events', async () => {

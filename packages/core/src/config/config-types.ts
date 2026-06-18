@@ -243,6 +243,14 @@ export interface RepoConfig {
   env?: Record<string, string>;
 
   /**
+   * Repo-owner-curated list of recommended workflow names, in display order.
+   * Pinned on top of both the Workflows page and the sidebar run dropdown
+   * under a "Recommended for this project" header. Names not matching any
+   * discovered workflow are silently ignored (advisory).
+   */
+  recommendedWorkflows?: string[];
+
+  /**
    * Default commands/workflows configuration
    */
   defaults?: {
@@ -354,4 +362,14 @@ export interface SafeConfig {
     loadDefaultCommands: boolean;
     loadDefaultWorkflows: boolean;
   };
+  /** Configured small/medium/large tier presets (merged repo > global). */
+  tiers?: RawTiersConfig;
+  /**
+   * Built-in tier presets for the current default provider (from
+   * tier-defaults.json via buildAiProfile). Lets the editor show what an
+   * unset tier resolves to without the web bundle importing @archon/workflows.
+   */
+  tierDefaults?: RawTiersConfig;
+  /** Configured @custom model aliases (merged repo > global). Not secrets. */
+  aliases?: RawAliasesConfig;
 }

@@ -362,7 +362,7 @@ Pi supports both OAuth subscriptions and API keys. Archon's adapter reads your e
 
 | Pi provider id | Env var |
 |---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` |
+| `anthropic` | `ANTHROPIC_OAUTH_TOKEN` (subscription, read first) or `ANTHROPIC_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
 | `google` | `GEMINI_API_KEY` |
 | `groq` | `GROQ_API_KEY` |
@@ -370,9 +370,9 @@ Pi supports both OAuth subscriptions and API keys. Archon's adapter reads your e
 | `cerebras` | `CEREBRAS_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
-| `huggingface` | `HUGGINGFACE_API_KEY` |
+| `huggingface` | `HF_TOKEN` |
 
-Additional cloud backends exist (Azure, Bedrock, Vertex, etc.) — file an issue if you need an env-var shortcut wired for them.
+The full backend → env-var map is generated from the installed Pi SDK (`bun run generate:pi-vendor-map`) and covers every key-based backend (DeepSeek, Together, Fireworks, Azure OpenAI, Vercel AI Gateway, Cloudflare, MiniMax, Moonshot, Z.AI, Xiaomi, …). Amazon Bedrock and Google Vertex authenticate via ambient cloud credentials (AWS chain / gcloud ADC) instead of a pasted key.
 
 **Local / custom providers (no credentials needed):**
 
@@ -862,7 +862,7 @@ The console **AI Settings** page (Settings in the web UI) has four sections:
 
 - **Model Tiers** — map the `small` / `medium` / `large` tiers to a provider + model (and optional effort). This writes the install's `tiers:` config and works on **any** install, even without `TOKEN_ENCRYPTION_KEY` (it's non-secret config). Pi tier models show a cost/reasoning/context hint from Pi's model catalog.
 - **Model Aliases** — define `@custom` refs (e.g. `@fast`) usable in workflow `model:` fields, with the same scope toggle.
-- **Agents** — one card per agent (Claude Code, Codex, Pi, Oh My Pi, OpenCode, Copilot). Agents with static credential metadata show the credentials they can spend nested inside, each with a readiness state (ready / needs credential). Connect a credential for *your* user inside the agent that uses it. Credentials are keyed by **vendor** (`anthropic`, `openai`, `github-copilot`, `openrouter`, …), and one credential serves every static agent that consumes it (for example, an `anthropic` key powers Claude Code and Pi's anthropic backend, so both static cards reflect it). Oh My Pi is dynamic: its provider/model universe and credential checks come from the OMP runtime, so its Archon card does not mirror per-vendor credential readiness. Every static vendor accepts an **API key**; **`anthropic`**, **`openai`**, and **`github-copilot`** additionally offer **subscription login** (an OAuth flow — for `openai`/ChatGPT it is an Archon-owned PKCE flow where you paste the redirect URL or code back, [#1924](https://github.com/coleam00/Archon/issues/1924)).
+- **Agents** — one card per agent (Claude Code, Codex, Pi, Oh My Pi, OpenCode, Copilot). Agents with static credential metadata show the credentials they can spend nested inside, each with a readiness state (ready / needs credential). Connect a credential for *your* user inside the agent that uses it. Credentials are keyed by **vendor** (`anthropic`, `openai`, `github-copilot`, `openrouter`, …), and one credential serves every static agent that consumes it (for example, an `anthropic` key powers Claude Code and Pi's anthropic backend, so both static cards reflect it). Oh My Pi is dynamic: its provider/model universe and credential checks come from the OMP runtime, so its Archon card does not mirror per-vendor credential readiness. Every static vendor accepts an **API key**; **`anthropic`**, **`openai`**, and **`github-copilot`** additionally offer **subscription login** (an OAuth flow — for `openai`/ChatGPT it is an Archon-owned PKCE flow where you paste the redirect URL or code back, [#1924](https://github.com/coleam00/Archon/issues/1924)). Legacy ids (`claude`/`codex`/`copilot`) are accepted and normalized. The **Pi** card keeps its 30+ backends behind a searchable "Add backend…" picker (with model counts from Pi's catalog) and shows ambient chains (Amazon Bedrock, Google Vertex) as status-only rows; the **OpenCode** card loads its backend catalog on demand from the embedded runtime — its connections are install-wide, not per-user.
 - **Defaults** — the default assistant and per-provider model defaults, plus a "Your default" (just-me) assistant select.
 
 ### Per-user model preferences ("Just me")
@@ -892,6 +892,7 @@ archon ai default codex --scope user
 ```
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
+
 ## How Assistant Selection Works
 
 - Assistant type is set per codebase via the `assistant` field in `.archon/config.yaml` or the `DEFAULT_AI_ASSISTANT` env var

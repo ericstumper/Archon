@@ -334,9 +334,9 @@ async function buildSessionConfig(
     model: resolvedModel,
     reasoningEffort: reasoning.effort,
     workingDirectory: cwd,
-    // SessionConfig.configDirectory only scopes session config/state; the
-    // runtime home that logged-in auth reads from is set on CopilotClientOptions.
-    configDirectory: copilotConfig.configDir,
+    // configDir moved to the client level in copilot-sdk 1.0 (baseDirectory —
+    // sets COPILOT_HOME on the spawned runtime); applied in sendQuery's
+    // CopilotClientOptions, not here.
     streaming: true,
     systemMessage: resolveSystemMessage(requestOptions),
     enableConfigDiscovery: copilotConfig.enableConfigDiscovery ?? false,
@@ -468,11 +468,7 @@ export class CopilotProvider implements IAgentProvider {
     const cliPath = await resolveCopilotBinaryPath(copilotConfig.copilotCliPath);
 
     const sdk = await import('@github/copilot-sdk');
-    const {
-      CopilotClient: copilotClientCtor,
-      RuntimeConnection: runtimeConnection,
-      approveAll,
-    } = sdk;
+    const { CopilotClient: copilotClientCtor, approveAll } = sdk;
 
     const warnings: ProviderWarning[] = [];
     const sessionConfig = await buildSessionConfig(
@@ -503,8 +499,11 @@ export class CopilotProvider implements IAgentProvider {
       workingDirectory: cwd,
       env: mergedEnv,
     };
+    // copilot-sdk 1.0: a custom CLI binary rides a stdio runtime connection
+    // (replaces the removed `cliPath` option).
+    if (cliPath) clientOpts.connection = { kind: 'stdio', path: cliPath };
+    // configDir override → baseDirectory (sets COPILOT_HOME on the runtime).
     if (copilotConfig.configDir) clientOpts.baseDirectory = copilotConfig.configDir;
-    if (cliPath) clientOpts.connection = runtimeConnection.forStdio({ path: cliPath });
     // Auth precedence: see COPILOT_TOKEN_ENV_KEY / GENERIC_GITHUB_TOKEN_ENV_KEYS docs.
     let tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
     if (copilotToken) {

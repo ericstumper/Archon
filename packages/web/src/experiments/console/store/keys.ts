@@ -28,4 +28,8 @@ export const K = {
   health: 'health' as const,
   providers: 'providers' as const,
   updateCheck: 'update-check' as const,
+  githubConnection: 'github-connection' as const,
+  providerConnections: 'provider-connections' as const,
+  userAiPrefs: 'user-ai-prefs' as const,
+  piModels: 'pi-models' as const,
 } as const;

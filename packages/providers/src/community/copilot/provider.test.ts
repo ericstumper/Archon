@@ -468,14 +468,16 @@ describe('CopilotProvider.sendQuery', () => {
 
     expect(lastClientOpts?.gitHubToken).toBeUndefined();
     expect(lastClientOpts?.useLoggedInUser).toBe(true);
-    // Client process starts in the request cwd; session tools also receive
-    // workingDirectory in createSession.
+    // copilot-sdk 1.0 rename guard: sessions must run in the request cwd via
+    // `workingDirectory` (was `cwd` pre-1.0 — a silent revert would strand
+    // sessions in the server's cwd).
     expect(lastClientOpts?.workingDirectory).toBe('/w');
-    // Dev mode resolves no custom CLI binary → SDK uses bundled/default CLI.
+    // Dev mode resolves no custom CLI binary → no stdio connection override
+    // (the SDK uses its bundled runtime).
     expect(lastClientOpts?.connection).toBeUndefined();
   });
 
-  test('configDir override sets Copilot client baseDirectory', async () => {
+  test('configDir override → client baseDirectory (COPILOT_HOME), sdk-1.0 placement', async () => {
     const session = makeFakeSession();
     nextCreateSessionResult = session;
 
@@ -491,8 +493,6 @@ describe('CopilotProvider.sendQuery', () => {
     await collect(gen);
 
     expect(lastClientOpts?.baseDirectory).toBe('/custom/copilot-home');
-    const opts = createSessionSpy.mock.calls[0]![0] as { configDirectory?: string };
-    expect(opts.configDirectory).toBe('/custom/copilot-home');
   });
 
   test('COPILOT_GITHUB_TOKEN is always used (intent signal)', async () => {

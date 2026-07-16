@@ -4,15 +4,20 @@
  * Both CLI and command-handler are thin formatting adapters over these functions.
  * Operations throw on errors; callers catch and format for their platform.
  */
-import { createLogger } from '@archon/paths';
+import { createLogger, captureApprovalResolved } from '@archon/paths';
 import {
   RESUMABLE_WORKFLOW_STATUSES,
-  TERMINAL_WORKFLOW_STATUSES,
   isApprovalContext,
+  isGateResolved,
 } from '@archon/workflows/schemas/workflow-run';
-import type { WorkflowRun, ApprovalContext } from '@archon/workflows/schemas/workflow-run';
+import type {
+  WorkflowRun,
+  ApprovalContext,
+  LoopGateRunMetadata,
+} from '@archon/workflows/schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
+import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
 
 // Lazy logger — NEVER at module scope
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -101,12 +106,19 @@ export async function resumeWorkflow(runId: string): Promise<WorkflowRun> {
 }
 
 /**
- * Abandon a non-terminal workflow run (marks it as cancelled).
+ * Abandon a workflow run (marks it as cancelled).
+ *
+ * Running, paused, AND failed runs can be abandoned. A `failed` run is terminal
+ * per TERMINAL_WORKFLOW_STATUSES but remains resumable, so the user must be able
+ * to discard it — hence the inline check here intentionally diverges from that
+ * constant and blocks only the two non-resumable terminal states.
  */
 export async function abandonWorkflow(runId: string): Promise<WorkflowRun> {
   const run = await getRunOrThrow(runId, 'operations.workflow_abandon_lookup_failed');
-  if (TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
-    throw new Error(`Cannot abandon run with status '${run.status}'. Run is already terminal.`);
+  if (run.status === 'completed' || run.status === 'cancelled') {
+    throw new Error(
+      `Cannot abandon run with status '${run.status}'. Only running, paused, or failed runs can be abandoned.`
+    );
   }
   try {
     await workflowDb.cancelWorkflowRun(runId);
@@ -125,7 +137,9 @@ export async function abandonWorkflow(runId: string): Promise<WorkflowRun> {
  * Approve a paused workflow run.
  *
  * Handles both interactive_loop and standard approval gate paths.
- * Transitions run to 'failed' so findResumableRun picks it up on next invocation.
+ * The run STAYS 'paused' — the resolution is recorded on the approval context
+ * (`metadata.approval.resolved`, #2075) and the resume machinery already picks
+ * up paused runs (resumableStatusClause / findResumableRunByParentConversation).
  * Does NOT auto-resume — callers decide whether to execute.
  */
 export async function approveWorkflow(
@@ -145,27 +159,57 @@ export async function approveWorkflow(
   if (!approval?.nodeId) {
     throw new Error('Workflow run is paused but missing approval context.');
   }
+  if (isGateResolved(approval)) {
+    // The run stays 'paused' after a resolution, so the status check alone no
+    // longer blocks a second approve — this guard does (double events, double
+    // telemetry). The resume CAS independently guards double-resume.
+    throw new Error(
+      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
 
-  const approvalComment = comment ?? 'Approved';
+  // Whitespace-only comments count as absent (mirrors feedbackProvided below):
+  // HTTP/CLI/chat pass the raw comment through since #2074, so '   ' would
+  // otherwise be recorded verbatim where the documented default is 'Approved'.
+  const approvalComment = comment !== undefined && comment.trim().length > 0 ? comment : 'Approved';
 
   try {
     // Interactive loop gate — store user input in metadata for the next iteration.
     // Note: node_completed is NOT written here. The executor writes it when the AI
-    // emits the completion signal (meaning the user actually approved). Writing it
-    // here would cause the resume to skip the loop node entirely.
+    // emits the completion signal (meaning the user actually approved) — or, for a
+    // signal-bearing gate approved without feedback, at resume time from the
+    // persisted signaledOutput (#2074). Writing it here would cause the resume to
+    // skip the loop node entirely.
     if (approval.type === 'interactive_loop') {
+      // Finalize-vs-iterate discriminator (#2074): derived from the RAW comment,
+      // not approvalComment (which defaults to 'Approved') — a bare approve on a
+      // signal-bearing gate finalizes at resume; real feedback runs another iteration.
+      const feedbackProvided = comment !== undefined && comment.trim().length > 0;
       await workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,
         event_type: 'approval_received',
         step_name: approval.nodeId,
         data: { decision: 'approved', comment: approvalComment, iteration: approval.iteration },
       });
-      // Transition to 'failed' so findResumableRun picks it up.
-      // IMPORTANT: metadata is MERGED (not replaced) — the approval context must survive
-      // intact so the resumed executor can detect the correct startIteration.
+      // Anonymous telemetry: binary resolution only — no ids/comments/names.
+      captureApprovalResolved({ resolution: 'approved' });
+      // Record the resolution; status stays 'paused' for an honest state machine.
+      // IMPORTANT: metadata is MERGED (not replaced) and the approval context is
+      // rewritten whole (spread + resolved) — it must survive intact so the
+      // resumed executor can detect the correct startIteration.
+      // loop_user_input keeps the 'Approved' default so the iterate path (non-signaled
+      // gates) still feeds the AI an approval token via $LOOP_USER_INPUT.
+      // Typed via LoopGateRunMetadata so the key spellings match the executor's
+      // resume-time read sites (a typo here is a compile error).
+      const gateRunMetadata: LoopGateRunMetadata = {
+        loop_user_input: approvalComment,
+        loop_feedback_given: feedbackProvided,
+      };
       await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
-        metadata: { loop_user_input: approvalComment },
+        metadata: {
+          approval: { ...approval, resolved: 'approved' },
+          ...gateRunMetadata,
+        },
       });
       return {
         workflowName: run.workflow_name,
@@ -191,10 +235,16 @@ export async function approveWorkflow(
       step_name: approval.nodeId,
       data: { decision: 'approved', comment: approvalComment },
     });
-    // Transition to 'failed' so findResumableRun picks it up. Clear any rejection state.
+    // Anonymous telemetry: binary resolution only — no ids/comments/names.
+    captureApprovalResolved({ resolution: 'approved' });
+    // Record the resolution; status stays 'paused'. Clear any rejection state.
     await workflowDb.updateWorkflowRun(runId, {
-      status: 'failed',
-      metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+      metadata: {
+        approval: { ...approval, resolved: 'approved' },
+        approval_response: 'approved',
+        rejection_reason: '',
+        rejection_count: 0,
+      },
     });
   } catch (error) {
     const err = error as Error;
@@ -217,7 +267,9 @@ export async function approveWorkflow(
 /**
  * Reject a paused workflow run.
  *
- * If `onRejectPrompt` is set and under max attempts, transitions to 'failed' for retry.
+ * If `onRejectPrompt` is set and under max attempts, the run stays 'paused'
+ * with the rejection staged on the approval context (`resolved: 'rejected'`,
+ * #2075) — the resume machinery picks it up and runs the on_reject rework.
  * Otherwise, cancels the run.
  */
 export async function rejectWorkflow(
@@ -234,6 +286,13 @@ export async function rejectWorkflow(
   const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
     ? rawApproval
     : undefined;
+  if (approval && isGateResolved(approval)) {
+    // Same double-resolution guard as approveWorkflow — the run stays 'paused'
+    // after a resolution, so status alone no longer blocks a second reject.
+    throw new Error(
+      `Workflow run ${runId} was already ${String(approval.resolved)} and is awaiting resume.`
+    );
+  }
   const rejectReason = reason ?? 'Rejected';
   const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
   const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
@@ -245,6 +304,8 @@ export async function rejectWorkflow(
       step_name: approval?.nodeId ?? 'unknown',
       data: { decision: 'rejected', reason: rejectReason },
     });
+    // Anonymous telemetry: binary resolution only — no ids/reasons/names.
+    captureApprovalResolved({ resolution: 'rejected' });
 
     if (approval?.onRejectPrompt !== undefined) {
       if (currentCount + 1 >= maxAttempts) {
@@ -259,9 +320,15 @@ export async function rejectWorkflow(
           maxAttemptsReached: true,
         };
       }
+      // Record the staged rework; status stays 'paused' (#2075). The approval
+      // context is rewritten whole (spread + resolved) so the resumed executor
+      // still sees nodeId/onRejectPrompt for the on_reject cycle.
       await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
-        metadata: { rejection_reason: rejectReason, rejection_count: currentCount + 1 },
+        metadata: {
+          approval: { ...approval, resolved: 'rejected' },
+          rejection_reason: rejectReason,
+          rejection_count: currentCount + 1,
+        },
       });
       return {
         workflowName: run.workflow_name,
@@ -292,4 +359,30 @@ export async function rejectWorkflow(
     cancelled: true,
     maxAttemptsReached: false,
   };
+}
+
+/**
+ * Reset persisted per-node provider sessions for a workflow.
+ *
+ * Filter: workflow_name is required; scope_key narrows to one conversation (or
+ * other scope), node_id narrows to one node within that scope. Omitting both
+ * scope_key and node_id deletes every row for the workflow across all scopes.
+ *
+ * Returns the row count deleted.
+ */
+export async function resetWorkflowNodeSessions(filter: {
+  workflow_name: string;
+  scope_key?: string;
+  node_id?: string;
+}): Promise<{ deleted: number }> {
+  try {
+    return await workflowNodeSessionDb.deleteWorkflowNodeSessions(filter);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, errorType: err.constructor.name, ...filter },
+      'operations.workflow_reset_node_sessions_failed'
+    );
+    throw new Error(`Failed to reset workflow node sessions: ${err.message}`);
+  }
 }

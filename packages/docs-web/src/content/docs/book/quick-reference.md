@@ -26,7 +26,7 @@ This chapter collects every CLI command, variable, and YAML option in one place.
 | `archon workflow run <name> --cwd /path "<prompt>"` | Run against a specific directory |
 | `archon workflow status` | Show status of active workflow runs |
 | `archon workflow resume <run-id>` | Resume a failed workflow run |
-| `archon workflow abandon <run-id>` | Abandon a non-terminal workflow run |
+| `archon workflow abandon <run-id>` | Abandon a workflow run (running, paused, or failed) |
 | `archon workflow cleanup [days]` | Delete old workflow run records (default: 7 days) |
 
 ### `archon isolation`
@@ -112,7 +112,6 @@ archon workflow run my-workflow "auth refresh-tokens"
 | `model` | No | string | Model for all nodes (`sonnet`, `opus`, `haiku`, or full model ID) |
 | `modelReasoningEffort` | No | string | Codex only: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
 | `webSearchMode` | No | string | Codex only: `disabled` \| `cached` \| `live` |
-| `additionalDirectories` | No | string[] | Extra directories available to the AI |
 
 ### Node Options (DAG)
 
@@ -126,8 +125,10 @@ All nodes share these base fields:
 | `bash` | One of | string | Shell script (runs without AI; stdout captured as `$nodeId.output`) |
 | `script` | One of | string | TypeScript/JavaScript (bun) or Python (uv) — inline or named ref to `.archon/scripts/`. Requires `runtime`. See [Script Nodes](/guides/script-nodes/) |
 | `loop` | One of | object | Loop configuration (see Loop Options below) |
+| `loop_group` | One of | object | Multi-node sub-DAG repeated per iteration (see Loop Group Options below) |
 | `approval` | One of | object | Pause for human review; see [Approval Nodes](/guides/approval-nodes/) |
 | `cancel` | One of | string | Reason string; terminates the run with `cancelled` status (not `failed`). Usually gated with `when:` |
+| `include` | One of | string | Name of another workflow whose nodes are inlined at discovery as a namespaced sub-DAG; see [Reusing a Shared Sub-DAG](/guides/authoring-workflows/#reusing-a-shared-sub-dag-with-include) |
 | `depends_on` | No | string[] | Node IDs that must complete before this node runs |
 | `when` | No | string | Condition expression; node is skipped if false |
 | `trigger_rule` | No | string | Join semantics when multiple upstreams exist (see Trigger Rules) |
@@ -135,14 +136,16 @@ All nodes share these base fields:
 | `model` | No | string | Per-node model override |
 | `context` | No | `fresh` \| `shared` | Session context — `fresh` starts a new conversation, `shared` inherits from prior node |
 | `output_format` | No | JSON Schema | Enforce structured JSON output from this node |
-| `allowed_tools` | No | string[] | Restrict available tools to this list (Claude only) |
-| `denied_tools` | No | string[] | Remove specific tools from this node's context (Claude only) |
+| `allowed_tools` | No | string[] | Restrict available tools to this list (Claude, OpenCode, Pi, Copilot, and Oh My Pi; use provider-specific tool names) |
+| `denied_tools` | No | string[] | Remove specific tools from this node's context (Claude, OpenCode, Pi, Copilot, and Oh My Pi; use provider-specific tool names) |
 | `idle_timeout` | No | number | Per-node idle timeout in milliseconds (default: 5 minutes) |
 | `retry` | No | object | Retry configuration for transient failures (see Retry Options). **Hard error on loop nodes** |
 | `hooks` | No | object | SDK hook callbacks (Claude only; see Hook Schema) |
-| `mcp` | No | string | Path to MCP server config JSON file (Claude only) |
-| `skills` | No | string[] | Skill names to preload into this node's context (Claude only) |
+| `mcp` | No | string | Path to MCP server config JSON file (Claude, Codex, and Oh My Pi) |
+| `skills` | No | string[] | Skill names to preload into this node's context (Claude, Pi, and Oh My Pi) |
 | `agents` | No | object | Inline sub-agent definitions keyed by kebab-case ID. Claude only |
+
+For OMP setup, model reference syntax, and provider-specific tool names, see [Oh My Pi (Community Provider)](/getting-started/ai-assistants/#oh-my-pi-community-provider).
 
 **Script-specific fields** (required when `script:` is set):
 
@@ -183,6 +186,9 @@ Defined under `loop:` inside a node:
 | `max_iterations` | Yes | number | Maximum iterations before the node fails |
 | `fresh_context` | No | boolean | Start a new session each iteration (default: false) |
 | `until_bash` | No | string | Shell script run after each iteration; exit 0 signals completion |
+| `interactive` | No | boolean | Pause at a human gate after each iteration for input via `/workflow approve` |
+| `gate_message` | No | string | Message shown at the interactive gate (required when `interactive: true`) |
+| `signal_completes` | No | boolean | Interactive loops only: a detected completion signal completes the node immediately (even on iteration 1) instead of gating (default: false) |
 
 **Example:**
 
@@ -192,6 +198,42 @@ Defined under `loop:` inside a node:
     prompt: "Review the current draft and improve it. Output COMPLETE when done."
     until: "COMPLETE"
     max_iterations: 5
+```
+
+### Loop Group Options
+
+Defined under `loop_group:` inside a node — repeats a sealed multi-node sub-DAG
+per iteration (see [Cross-Node Loops](/guides/loop-nodes/#cross-node-loops-with-loop_group)):
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `nodes` | Yes | node[] | Sub-DAG body re-run in full each iteration. Any node type, including nested `loop_group`. `depends_on` is body-scoped; body ids must not shadow outer ids |
+| `until` | Yes | string | Completion signal — checked in the body's terminal-node output |
+| `max_iterations` | Yes | number | Maximum iterations before the node fails |
+| `fresh_context` | No | boolean | `true` starts fresh body AI sessions each iteration (default: false — sessions continue) |
+| `until_bash` | No | string | Shell script run after each iteration; exit 0 signals completion |
+| `interactive` | No | boolean | Pause at a human gate after each non-completing iteration |
+| `gate_message` | No | string | Message shown at the interactive gate |
+| `signal_completes` | No | boolean | Interactive loops only: a detected completion signal completes the group immediately (even on iteration 1) instead of gating (default: false) |
+
+Body nodes can reference the previous iteration via
+`$LOOP_PREV.<nodeId>.output`, and outer-DAG outputs via plain `$nodeId.output`.
+`retry` is rejected on `loop_group` nodes; `model`/`provider` set on the group
+become defaults for body AI nodes.
+
+**Example:**
+
+```yaml
+- id: fix-loop
+  loop_group:
+    until: TESTS_PASS
+    max_iterations: 5
+    nodes:
+      - id: implement
+        prompt: "Fix the failing tests. Previous run: $LOOP_PREV.test.output"
+      - id: test
+        bash: bun test
+        depends_on: [implement]
 ```
 
 ### Retry Options
@@ -293,9 +335,9 @@ defaults:
 | `Routing unclear — falling back to archon-assist` | No workflow matched the input | Use an explicit workflow name: `archon workflow run my-workflow "..."` |
 | `Worktree already exists for branch X` | Prior run left a worktree | Run `archon complete X` or `archon isolation cleanup` |
 | `Not a git repository` | Running outside a repo | `cd` into a git repo first — workflow and isolation commands require one |
-| `Unknown provider 'X'. Registered: claude, codex, pi` | Typo in `provider:` (workflow root or node-level) | Set `provider:` to one of the registered ids. Model strings themselves are not validated at load time — the SDK rejects unknown models at request time. |
+| `Unknown provider 'X'. Registered: claude, codex, opencode, pi, copilot, omp` | Typo in `provider:` (workflow root or node-level) | Set `provider:` to one of the registered ids. Model strings themselves are not validated at load time — the SDK rejects unknown models at request time. |
 | `$BASE_BRANCH referenced but could not be detected` | No base branch set and auto-detection failed | Set `worktree.baseBranch` in `.archon/config.yaml` or ensure `main`/`master` exists |
-| Workflow hangs with no output | Node idle timeout hit | Increase `idle_timeout` on the node (milliseconds) |
+| Node fails with "timed out with no output" | `idle_timeout` fired before the provider emitted anything (time-to-first-token exceeded the window) | Increase `idle_timeout` on the node or reduce prompt size |
 
 ### Debug Techniques
 

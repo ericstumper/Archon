@@ -8,9 +8,16 @@ import type { IsolationEnvironmentRow } from '@archon/isolation';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
+  captureApprovalResolved: () => undefined,
   createLogger: mock(() => mockLogger),
   getArchonWorkspacesPath: mock(() => '/home/test/.archon/workspaces'),
+  ensureArchonWorkspacesPath: mock(() => Promise.resolve('/home/test/.archon/workspaces')),
   getArchonHome: mock(() => '/home/test/.archon'),
+  getCredentialKeyPath: mock(() => '/home/test/.archon/credential-key'),
+  // Required by @archon/git (loaded via orchestrator.ts's toBranchName import).
+  getProjectWorktreesPath: mock(
+    (owner: string, repo: string) => `/home/test/.archon/workspaces/${owner}/${repo}/worktrees`
+  ),
 }));
 
 // DB mocks
@@ -34,6 +41,13 @@ mock.module('../db/isolation-environments', () => ({
   })),
 }));
 
+// orchestrator.ts resolves the per-user no-reply email for worktree git identity;
+// mock it (like the other db deps) so the real db/connection + adapters aren't
+// dragged into this test's light module graph.
+mock.module('../db/user-github-token-store', () => ({
+  getUserGithubNoreplyEmail: mock(() => Promise.resolve(null)),
+}));
+
 mock.module('../db/sessions', () => ({
   getActiveSession: mock(() => Promise.resolve(null)),
   createSession: mock(() => Promise.resolve(null)),
@@ -52,6 +66,10 @@ mock.module('../handlers/command-handler', () => ({
 
 mock.module('@archon/providers', () => ({
   getAgentProvider: mock(() => null),
+  getRegisteredProviders: mock(() => []),
+  // credentials/delivery (#1955) imports these from '@archon/providers'.
+  PI_PROVIDER_ENV_VARS: { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY' },
+  PI_AMBIENT_VENDORS: ['amazon-bedrock', 'google-vertex'],
 }));
 
 mock.module('../workflows/store-adapter', () => ({
@@ -124,6 +142,13 @@ mock.module('@archon/workflows/utils/tool-formatter', () => ({
 
 mock.module('fs', () => ({
   existsSync: mock(() => true),
+  // token-crypto.ts imports these from node:fs for the auto-provisioned credential
+  // key. readFileSync returns a valid 64-hex key so getEncryptionKey() resolves
+  // without any real disk write when the per-user credential path is exercised.
+  readFileSync: mock(() => 'a'.repeat(64)),
+  writeFileSync: mock(() => undefined),
+  mkdirSync: mock(() => undefined),
+  chmodSync: mock(() => undefined),
 }));
 
 mock.module('../services/title-generator', () => ({
@@ -229,5 +254,43 @@ describe('validateAndResolveIsolation', () => {
       'Cleaned up 3 merged worktree(s) to make room.'
     );
     expect(result.status).toBe('new');
+  });
+
+  test('passes codebase default_branch to the resolver as defaultBranch', async () => {
+    const conversation = makeConversation();
+    const codebase = makeCodebase({ default_branch: 'develop' });
+
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow(),
+      cwd: '/worktrees/issue-42',
+      method: { type: 'created' },
+    });
+
+    await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
+
+    const request = mockResolve.mock.calls.at(-1)?.[0] as unknown as {
+      codebase: { defaultBranch?: string | null };
+    };
+    expect(request.codebase.defaultBranch).toBe('develop');
+  });
+
+  test('passes null defaultBranch to the resolver when the codebase has none stored', async () => {
+    const conversation = makeConversation();
+    const codebase = makeCodebase({ default_branch: null });
+
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow(),
+      cwd: '/worktrees/issue-42',
+      method: { type: 'created' },
+    });
+
+    await validateAndResolveIsolation(conversation, codebase, platform, 'conv-1');
+
+    const request = mockResolve.mock.calls.at(-1)?.[0] as unknown as {
+      codebase: { defaultBranch?: string | null };
+    };
+    expect(request.codebase.defaultBranch).toBeNull();
   });
 });

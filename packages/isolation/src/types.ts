@@ -7,6 +7,12 @@
  */
 
 import type { RepoPath, BranchName } from '@archon/git';
+import type { ExecutionContext } from '@archon/providers/types';
+
+// Re-exported so isolation consumers can source the execution-context contract
+// from `@archon/isolation` alongside the backend types that produce it, without
+// reaching into `@archon/providers/types` directly.
+export type { ExecutionContext };
 
 // --- Provider Types ---
 
@@ -42,7 +48,26 @@ interface IsolationRequestBase {
    */
   canonicalRepoPath: RepoPath;
 
+  /**
+   * Preferred base branch for new worktrees when repo config does not override
+   * it (`worktree.baseBranch` still wins).
+   *
+   * Populated from the registered codebase's stored `default_branch` so
+   * locally-registered repos with non-main defaults do not depend on
+   * `origin/HEAD` being set for auto-detection.
+   */
+  baseBranch?: BranchName;
+
   description?: string;
+
+  /**
+   * Optional git author identity to stamp on the new worktree (`git config
+   * user.email`/`user.name`). Populated from the originating user's connected
+   * GitHub no-reply email so workflow commits attribute to the human. Absent in
+   * solo installs and for unconnected users — the worktree then inherits the
+   * ambient git identity (unchanged behavior).
+   */
+  gitIdentity?: { email: string; name?: string };
 }
 
 export interface IssueIsolationRequest extends IsolationRequestBase {
@@ -234,6 +259,8 @@ export interface IsolationEnvironmentRow {
   status: EnvironmentStatus;
   created_at: Date;
   created_by_platform: string | null;
+  /** FK to remote_agent_users.id; populated by chat/forge adapters via the resolver. */
+  created_by_user_id: string | null;
   metadata: Record<string, unknown>;
 }
 
@@ -291,6 +318,8 @@ export interface CreateEnvironmentParams {
   working_path: string;
   branch_name: BranchName;
   created_by_platform?: string;
+  /** FK to remote_agent_users.id; threaded from ResolveRequest.userId. */
+  created_by_user_id?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -302,9 +331,29 @@ export interface ResolveRequest {
     id: string;
     defaultCwd: string;
     name: string;
+    /**
+     * The codebase's stored default branch (from registration). Threaded into
+     * the provider's `IsolationRequest.baseBranch` as the fallback base for new
+     * worktrees when repo config sets no `worktree.baseBranch`.
+     */
+    defaultBranch?: BranchName | null;
+    /**
+     * Project kind. `'folder'` projects run in place at `defaultCwd` with no
+     * worktree isolation; the resolver short-circuits to `{ status: 'none' }`.
+     * Optional/absent is treated as `'repo'` (unchanged worktree behavior).
+     */
+    kind?: 'repo' | 'folder';
   } | null;
   hints?: IsolationHints;
   platformType: string;
+  /** Archon user UUID; populated by chat/forge adapter handlers. */
+  userId?: string;
+  /**
+   * Git author identity to stamp on a newly-created worktree (no-reply email of
+   * the originating user's connected GitHub account). Forwarded into the
+   * IsolationRequest passed to the provider. Absent → ambient git identity.
+   */
+  gitIdentity?: { email: string; name?: string };
 }
 
 export type ResolutionMethod =
@@ -325,3 +374,53 @@ export type IsolationResolution =
   | { status: 'stale_cleaned'; previousEnvId: string }
   | { status: 'none'; cwd: string }
   | { status: 'blocked'; reason: IsolationBlockReason; userMessage: string };
+
+// --- Isolation Backend Seam (folder projects only) ---
+//
+// Repo-kind projects keep the worktree path (IIsolationProvider above) untouched.
+// Folder-kind projects route through a pluggable backend selected by
+// `resolveFolderBackend()`. v1 backends: `in-place` (default, today's behavior)
+// and `container` (Phase B). Worktrees are deliberately NOT a backend — the two
+// lifecycles don't share an interface (user decision 2026-07-13).
+
+/**
+ * Minimal identity of a codebase a backend needs to prepare an environment.
+ * Container-specific inputs (image, network, run id) are added by Phase B — kept
+ * out of the Phase A contract to avoid speculative surface (YAGNI).
+ */
+export interface BackendPrepareRequest {
+  codebase: {
+    id: string;
+    /** Absolute path to the folder-project root. */
+    defaultCwd: string;
+    name: string;
+    kind: 'repo' | 'folder';
+  };
+}
+
+/**
+ * Result of a backend `prepare()`: the working directory the run should use and
+ * the execution context (host vs container) threaded through the engine to every
+ * provider turn and deterministic subprocess. `envId` references the tracked
+ * `isolation_environments` row when the backend created one (container backend,
+ * Phase B); in-place runs create no row and leave it undefined.
+ */
+export interface PreparedEnv {
+  cwd: string;
+  execContext: ExecutionContext;
+  envId?: string;
+}
+
+/**
+ * Isolation backend for FOLDER-kind projects. Phase A ships only the required
+ * lifecycle (`prepare`/`destroy`) implemented by the in-place backend; the
+ * container backend (Phase B) extends this interface with the pause/resume and
+ * write-back methods it alone needs. Adding those later is backward-compatible —
+ * they are intentionally absent here rather than declared unimplemented.
+ */
+export interface IIsolationBackend {
+  readonly id: 'in-place' | 'container';
+  prepare(req: BackendPrepareRequest): Promise<PreparedEnv>;
+  /** Tear down a prepared environment. No-op for in-place (nothing was created). */
+  destroy(envId: string): Promise<void>;
+}

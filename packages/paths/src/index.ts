@@ -4,8 +4,10 @@ export {
   isDocker,
   getArchonHome,
   getArchonWorkspacesPath,
+  ensureArchonWorkspacesPath,
   getArchonWorktreesPath,
   getArchonConfigPath,
+  getCredentialKeyPath,
   getArchonEnvPath,
   getRepoArchonEnvPath,
   getHomeWorkflowsPath,
@@ -27,12 +29,23 @@ export {
   getProjectLogsPath,
   getRunArtifactsPath,
   getRunLogPath,
+  sanitizeScopeSegment,
+  getScopeArtifactsPath,
+  slugifyFolderName,
+  getFolderProjectRoot,
+  getFolderProjectArtifactsPath,
+  getFolderProjectLogsPath,
+  getFolderRunArtifactsPath,
+  ensureFolderProjectStructure,
   resolveProjectRootFromCwd,
   ensureProjectStructure,
   createProjectSourceSymlink,
   findMarkdownFilesRecursive,
   getWebDistDir,
 } from './archon-paths';
+
+// Env loader
+export { loadArchonEnv, isVerboseBoot } from './env-loader';
 
 // Logger
 export { createLogger, setLogLevel, getLogLevel, rootLogger } from './logger';
@@ -50,6 +63,36 @@ export {
 } from './update-check';
 export type { UpdateCheckResult } from './update-check';
 
+// Tier notice (one-time CLI notice for unconfigured tier-keyword workflows)
+export { readTierNoticeState, markTierNoticeShown } from './tier-notice';
+export type { TierNoticeState } from './tier-notice';
+
 // Anonymous telemetry
-export { captureWorkflowInvoked, shutdownTelemetry, isTelemetryDisabled } from './telemetry';
-export type { WorkflowInvokedProperties } from './telemetry';
+export {
+  captureWorkflowInvoked,
+  captureArchonStarted,
+  captureArchonActive,
+  captureChatTurn,
+  captureApprovalResolved,
+  captureCodebaseRegistered,
+  captureWorkflowCompleted,
+  classifyWorkflowForTelemetry,
+  TELEMETRY_SCHEMA_VERSION,
+  shutdownTelemetry,
+  isTelemetryDisabled,
+  getTelemetryStatus,
+  resetTelemetryId,
+} from './telemetry';
+export type {
+  WorkflowInvokedProperties,
+  ArchonStartedProperties,
+  ChatTurnProperties,
+  DeploymentShapeProperties,
+  WorkflowCompletedProperties,
+  WorkflowExitReason,
+  WorkflowErrorClass,
+  WorkflowNodeType,
+  WorkflowTelemetrySource,
+  TelemetryStatus,
+  TelemetryDisabledReason,
+} from './telemetry';

@@ -37,7 +37,7 @@ Run AI-powered workflows from your terminal.
 ## Quick Start
 
 ```bash
-# List available workflows (requires git repository)
+# List available workflows (requires a git repo, a registered folder project, or --folder on first use)
 archon workflow list --cwd /path/to/repo
 
 # Run a workflow (auto-creates isolated worktree by default)
@@ -50,7 +50,7 @@ archon workflow run plan --cwd /path/to/repo --branch feature-auth "Add OAuth su
 archon workflow run assist --cwd /path/to/repo --no-worktree "Quick question"
 ```
 
-**Note:** Workflow and isolation commands require running from within a git repository. Running from subdirectories automatically resolves to the repo root. The `version`, `help`, `chat`, `setup`, and `serve` commands work anywhere.
+**Note:** Workflow and isolation commands normally require running from within a git repository (running from subdirectories automatically resolves to the repo root). A non-git directory also works if it's a registered [folder project](/getting-started/concepts/#folder-projects-non-git-workspaces) — or on first use by passing `--folder`, which registers it and runs in place. The `version`, `help`, `chat`, `setup`, `serve`, and `doctor` commands work anywhere.
 
 ## Commands
 
@@ -83,6 +83,83 @@ archon setup --spawn              # open in a new terminal window
 | `--spawn` | Open setup wizard in a new terminal window. |
 
 **Write safety**: `archon setup` never writes to `<cwd>/.env` — that file belongs to you. The wizard always targets one archon-owned file chosen by `--scope`, merges into existing content (so user-added keys survive), and writes a timestamped backup before every rewrite (e.g. `~/.archon/.env.archon-backup-2026-04-20T09-28-11-000Z`).
+
+**Default assistant + chat model**: after you pick the default assistant, the wizard offers an optional default chat model for it — a short curated list (e.g. `sonnet`/`opus`/`haiku` for Claude) plus an "Other…" free-text entry. Press Enter to keep the SDK default. Your selection is recorded in `~/.archon/config.yaml` as `defaultAssistant` (plus `assistants.<provider>.model` when you chose a model) — the same write as [`archon ai default <provider> [<model>]`](#ai) — and re-running setup shows the current model. Pi skips the model prompt because its backend/model pair is chosen earlier in the wizard.
+
+### `doctor`
+
+Verify your Archon setup. Runs a checklist of common failure points: Claude binary spawn, gh CLI auth, Pi auth (when Pi is configured as default), database reachability, workspace writability, bundled defaults, folder-project detection (contained repos, when run from one), telemetry state, AI credentials (connected provider count, best-effort), and adapter token pings (Slack/Telegram, best-effort).
+
+```bash
+archon doctor
+```
+
+Exit code 0 if all checks pass or are skipped; 1 if any critical check fails. Adapter pings degrade to `skip` on network errors — a flaky connection does not flip the result red.
+
+Also runs automatically at the end of `archon setup` (optional).
+
+### `auth github`
+
+Connect the current CLI user's GitHub identity via the GitHub device flow, so workflow commits, PR comments, and pushes attribute to you instead of the bot.
+
+```bash
+archon auth github
+```
+
+Only meaningful on **multi-user installs** running GitHub App mode (`GITHUB_APP_ID` + `GITHUB_APP_CLIENT_ID`) with `TOKEN_ENCRYPTION_KEY` set — solo `GITHUB_TOKEN` installs don't need it and the command exits with an explanatory error. Your CLI identity is resolved from `ARCHON_USER_ID` (explicit override) or `$USER` / `$USERNAME`, mapped to a stable Archon user via the `cli` platform identity.
+
+The command prints a `verification_uri` and a one-time `user_code`; visit the URL, enter the code, and authorize. On success the access/refresh tokens are stored encrypted (AES-256-GCM) in Archon's database. Exit code 0 on success; 1 if per-user GitHub is disabled, the identity can't be resolved, the code expires, or authorization is denied.
+
+### `ai`
+
+Manage **per-user AI-provider credentials** (API keys + subscriptions) and **model-tier config**. CLI identity is resolved from `ARCHON_USER_ID` (explicit override) or `$USER` / `$USERNAME`, mapped to a stable Archon user via the `cli` platform identity — the same as [`auth github`](#auth-github).
+
+The credential subcommands (`key set`, `login`, `list`, `logout`) work on **any install** — the vault is auto-provisioned. CLI identity is resolved from `ARCHON_USER_ID` or `$USER`/`$USERNAME`. The config subcommands (`tier`, `alias`, `default`) are **ungated** — they write `~/.archon/config.yaml` and need no identity.
+
+```bash
+# --- Provider credentials (any install — vault auto-provisioned) ---
+archon ai key set <vendor>       # connect an API key (masked prompt or piped stdin — never argv)
+archon ai login <vendor>         # connect a subscription via OAuth (anthropic, openai, or github-copilot)
+archon ai list                   # list connected credentials (metadata only, no secrets)
+archon ai logout <vendor>        # disconnect a credential
+
+# --- Model tiers + aliases + default assistant (ungated config) ---
+archon ai tier set <small|medium|large> <provider> <model> [--effort <effort>] [--scope user|install]
+archon ai tier list [--json]     # show configured tiers (install + yours) vs built-in defaults
+archon ai tier unset <small|medium|large> [--scope user|install]
+archon ai alias set <@name> <provider> <model> [--effort <effort>] [--scope user|install]
+archon ai alias list [--json]    # show @custom aliases (install + yours)
+archon ai alias unset <@name> [--scope user|install]
+archon ai default <provider> [<model>] [--scope user|install]   # set the default assistant (+ optional chat model)
+```
+
+Credential ids are **vendor-keyed** (`anthropic`, `openai`, `github-copilot`, plus the Pi backends like `openrouter`); legacy `claude`/`codex`/`copilot` are accepted and normalized with a printed notice. `ai login` supports subscription login for **`anthropic`**, **`openai`** (ChatGPT/Codex), and **`github-copilot`**. The `openai` login is an Archon-owned PKCE flow ([#1924](https://github.com/coleam00/Archon/issues/1924)): authorize in the browser, then paste the authorization code or the full `localhost:1455` redirect URL back at the prompt — nothing needs to listen on that port. The API key is never read from argv (it would leak into shell history): pipe it (`echo "$KEY" | archon ai key set openrouter`) or type it at the masked prompt.
+
+`ai tier`, `ai alias`, and `ai default` edit the same `tiers:` / `aliases:` / `defaultAssistant` config you can hand-write in `~/.archon/config.yaml` (see [Configuration](/reference/configuration/)) or edit from the console **AI Settings** page. An unknown provider exits non-zero; `tier unset` removes the override so the tier falls back to its built-in preset. The full per-user setup walkthrough is in [Per-user credentials and AI Settings](/getting-started/ai-assistants/#per-user-credentials-and-ai-settings).
+
+**`ai default <provider> [<model>]` (default chat model).** The optional `<model>` sets the default **chat** model alongside the assistant. At `--scope install` it writes `assistants.<provider>.model` in `~/.archon/config.yaml` (omitting the model leaves that field untouched). At `--scope user` the provider and model are written **atomically** to your prefs row — `archon ai default pi --scope user` clears any previous model pin, since a pin is only meaningful for the provider it was set with. Your chat model applies to direct chat only; workflow nodes keep resolving the `large` tier. The model may also be an `@alias` or tier keyword.
+
+**`--scope user` (per-user overrides).** On any of the config subcommands, `--scope user` writes your **personal** prefs row in Archon's database instead of the shared `config.yaml`. Your tiers/aliases/default override the install config for runs and chats *you* start — nobody else's. It needs a resolvable CLI identity (`ARCHON_USER_ID` or `$USER`) but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets). `ai tier list` / `ai alias list` show both scopes, marking your overrides with `[just you]`. The same scopes are editable in the console as the "This install / Just me" toggle on **AI Settings**.
+
+### `telemetry status`
+
+Show the current anonymous telemetry state: whether it is enabled, the opt-out reason if not, the install UUID, the active PostHog host, and the key source.
+
+```bash
+archon telemetry status
+```
+
+Useful for verifying that an opt-out env var (`DO_NOT_TRACK=1`, `ARCHON_TELEMETRY_DISABLED=1`, `CI=true`, `POSTHOG_API_KEY=off`) is being picked up. Inspecting status never creates a `telemetry-id` file while opted out.
+
+### `telemetry reset`
+
+Rotate the persisted anonymous install UUID at `~/.archon/telemetry-id`. The previous ID is overwritten and not recoverable.
+
+```bash
+archon telemetry reset
+```
+
+Exit code 0 on success; 1 if the ID file cannot be written.
 
 ### `workflow list`
 
@@ -128,9 +205,11 @@ Progress events (node start/complete/fail/skip, approval gates) are written to s
 | `--branch <name>` | Explicit branch name for the worktree |
 | `--from <branch>`, `--from-branch <branch>` | Override base branch (start-point for worktree) |
 | `--no-worktree` | Opt out of isolation -- run directly in live checkout |
+| `--folder` | Register the current non-git directory as a folder project (first use) and run in place -- no worktree. Rejects `--branch`/`--from`. |
 | `--resume` | Resume from last failed run at the working path (skips completed nodes) |
 | `--quiet`, `-q` | Suppress all progress output to stderr |
 | `--verbose`, `-v` | Also show tool-level events (tool name and duration) |
+| `--detach` | Run in a detached background child and return immediately. The child does all the work; find it later with `workflow runs`/`workflow get`. Child stdout/stderr is captured to `~/.archon/logs/detached-run-<id>.log`. Combine with `--json` for a machine-readable ack. |
 
 **Default (no flags):**
 - Creates worktree with auto-generated branch (`archon/task-<workflow>-<timestamp>`)
@@ -161,11 +240,38 @@ Ambiguous workflow 'review'. Did you mean:
 
 ### `workflow status`
 
-Show all running workflow runs across all worktrees.
+Show **active** workflow runs (running and paused) across all worktrees. For full history (all statuses) scoped to the current project, use `workflow runs`.
 
 ```bash
 archon workflow status
 archon workflow status --json
+archon workflow status --verbose   # add a per-node summary for each run
+```
+
+### `workflow runs`
+
+List recent runs of **every** status (completed, failed, cancelled, running, paused) for the current project. The project is resolved from `cwd` the same way `workflow run` does. Complements `workflow status` (which is active-only).
+
+```bash
+archon workflow runs
+archon workflow runs --json
+archon workflow runs --status failed   # filter to one status
+archon workflow runs --limit 50        # cap rows (default 20)
+archon workflow runs --all             # list across all projects (ignore cwd scope)
+```
+
+If `cwd` is not a registered project, the command falls back to a global list and says so — `--json` carries this as a `scopeFallback: true` field so a consuming agent never mistakes a global result for a project-scoped one.
+
+The listing shows short 8-character run ids. Every `<run-id>` command below (`get`, `resume`, `abandon`, `approve`, `reject`) accepts these short ids when run from the project directory: a unique prefix resolves to the full id, an ambiguous prefix errors, and full ids keep working from any directory. Short ids from `--all` rows belonging to *other* projects can't be resolved — use the full id from `--json` for those.
+
+### `workflow get`
+
+Show detail for a single run by ID, regardless of status (unlike `status`, which is active-only). Use it to answer "did that run pass?" for a completed/failed run. Exits non-zero when the run is not found.
+
+```bash
+archon workflow get <run-id>
+archon workflow get <run-id> --json
+archon workflow get <run-id> --verbose   # add the per-node event summary
 ```
 
 ### `workflow resume`
@@ -174,7 +280,10 @@ Resume a failed workflow run. Re-executes the workflow, automatically skipping n
 
 ```bash
 archon workflow resume <run-id>
+archon workflow resume <run-id> --json   # validate + ack only; does NOT re-execute inline
 ```
+
+In `--json` mode the command is a non-blocking control-plane ack: it validates the run is resumable and reports its state but does **not** re-execute inline (execution streams output to stdout, which would corrupt the JSON). To actually drive a resumable run to completion, use the blocking form or `workflow run <name> --resume --detach`.
 
 ### `workflow abandon`
 
@@ -182,17 +291,23 @@ Discard a workflow run (marks it as `cancelled`). Use this to unblock a worktree
 
 ```bash
 archon workflow abandon <run-id>
+archon workflow abandon <run-id> --json
 ```
 
 ### `workflow approve`
 
 Approve a paused workflow run at an interactive approval gate. Optionally provide a comment that is available to the workflow via `$LOOP_USER_INPUT`.
 
+**Interactive-loop gates — finalize vs iterate:** when the gate paused on an iteration that emitted the loop's completion signal (`workflow get <run-id> --json` → `.metadata.approval.completionSignaled` is `true`), approving with **no comment** accepts the completion — the node finalizes from the already-computed output on resume, with no re-run. Approving **with** a comment runs another iteration using it as `$LOOP_USER_INPUT`. On a non-signaled gate, both forms run another iteration.
+
 ```bash
 archon workflow approve <run-id>
 archon workflow approve <run-id> "Looks good, proceed"
 archon workflow approve <run-id> --comment "Looks good, proceed"
+archon workflow approve <run-id> --json   # record approval + ack; does NOT auto-resume inline
 ```
+
+In human mode `approve`/`reject` auto-resume the run inline. In `--json` mode they record the decision and return an ack **without** resuming (the run is left resumable for a backgrounded `resume`/`run --resume`).
 
 ### `workflow reject`
 
@@ -201,6 +316,7 @@ Reject a paused workflow run at an approval gate. Optionally provide a reason th
 ```bash
 archon workflow reject <run-id>
 archon workflow reject <run-id> --reason "Needs more tests"
+archon workflow reject <run-id> --json
 ```
 
 ### `workflow cleanup`
@@ -275,7 +391,7 @@ archon validate workflows my-workflow     # Validate a single workflow
 archon validate workflows my-workflow --json  # Machine-readable JSON output
 ```
 
-Checks: YAML syntax, DAG structure (cycles, dependency refs), command file existence, MCP config files, skill directories, provider compatibility. Returns actionable error messages with "did you mean?" suggestions for typos.
+Checks: YAML syntax, DAG structure (cycles, dependency refs), command file existence, MCP config files, skill directories, provider compatibility, and tier/alias model refs. For bundled and global workflows, validation rejects `@custom` model aliases because they are not portable across projects; use `small`, `medium`, `large`, or a literal provider model string instead. Returns actionable error messages with "did you mean?" suggestions for typos.
 
 Exit code: 0 = all valid, 1 = errors found.
 
@@ -335,6 +451,20 @@ archon serve --download-only
 
 The cached web UI is stored at `~/.archon/web-dist/<version>/`. Each version is cached independently, so upgrading the binary automatically downloads the matching web UI.
 
+### `skill install [path]`
+
+Install the bundled Archon skills into both `.claude/skills/` (Claude Code) and `.agents/skills/` (Codex) directories of a project. Always overwrites existing files to ensure the latest version shipped with the current Archon binary is installed.
+
+```bash
+# Install into the current directory
+archon skill install
+
+# Install into a specific project
+archon skill install /path/to/project
+```
+
+Two skills are installed: **`archon`**, which teaches the assistant how to work with Archon workflows, commands, and project conventions; and **`manage-run`**, a focused skill for inspecting and controlling workflow runs via the `archon` CLI. Each skill is written to both `.claude/skills/<skill>/` (Claude Code) and `.agents/skills/<skill>/` (Codex's canonical project-level skill path). Both are also installed automatically during `archon setup`.
+
 ### `version`
 
 Show version, build type, and database info.
@@ -350,7 +480,7 @@ archon version
 | `--cwd <path>` | Override working directory (default: current directory) |
 | `--quiet`, `-q` | Reduce log verbosity to warnings and errors only |
 | `--verbose`, `-v` | Show debug-level output |
-| `--json` | Output machine-readable JSON (for workflow list, workflow status) |
+| `--json` | Output machine-readable JSON (workflow `list`, `status`, `runs`, `get`, and the write commands `approve`/`reject`/`abandon`/`resume`). Implies log suppression so stdout is exactly the JSON payload. |
 | `--help`, `-h` | Show help message |
 
 ## Working Directory
@@ -372,8 +502,8 @@ At startup, the CLI strips all Bun-auto-loaded CWD `.env` keys and nested Claude
 
 On startup, the CLI:
 1. Strips `<cwd>/.env*` keys + `CLAUDECODE` markers from `process.env` (via `stripCwdEnv`). Emits `[archon] stripped N keys from <cwd> (...)` when N > 0.
-2. Loads `~/.archon/.env` (user scope). Emits `[archon] loaded N keys from ~/.archon/.env` when N > 0.
-3. Loads `<cwd>/.archon/.env` (project scope, overrides user scope). Emits `[archon] loaded N keys from <path> (repo scope, overrides user scope)` when N > 0.
+2. Loads `~/.archon/.env` (user scope). Emits `[archon] loaded N keys …` when N > 0 **and** `ARCHON_VERBOSE_BOOT=1` or `LOG_LEVEL=debug/trace` is set.
+3. Loads `<cwd>/.archon/.env` (project scope, overrides user scope). Same verbosity gate as step 2.
 4. Auto-enables global Claude auth if no explicit tokens are set.
 
 `<cwd>/.env` is never loaded — it belongs to the target project. See [Configuration Reference: `.env` File Locations](/reference/configuration/#env-file-locations) for the full three-path model.

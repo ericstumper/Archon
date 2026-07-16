@@ -13,8 +13,8 @@ export { stepRetryConfigSchema } from './retry';
 export type { StepRetryConfig } from './retry';
 
 // Loop node configuration
-export { loopNodeConfigSchema } from './loop';
-export type { LoopNodeConfig } from './loop';
+export { loopNodeConfigSchema, loopControlSchema } from './loop';
+export type { LoopNodeConfig, LoopControl } from './loop';
 
 // Hooks
 export {
@@ -34,24 +34,33 @@ export {
   promptNodeSchema,
   bashNodeSchema,
   loopNodeSchema,
+  loopGroupNodeSchema,
+  loopGroupNodeConfigSchema,
   approvalNodeSchema,
   approvalOnRejectSchema,
   cancelNodeSchema,
   scriptNodeSchema,
+  includeNodeSchema,
   dagNodeSchema,
   isBashNode,
   isLoopNode,
+  isLoopGroupNode,
   isApprovalNode,
   isCancelNode,
   isScriptNode,
+  isIncludeNode,
+  isPersistableNode,
   isTriggerRule,
   BASH_NODE_AI_FIELDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
+  LOOP_GROUP_NODE_AI_FIELDS,
+  INCLUDE_NODE_IGNORED_FIELDS,
   effortLevelSchema,
   thinkingConfigSchema,
   sandboxSettingsSchema,
   agentDefinitionSchema,
+  piNodeConfigSchema,
 } from './dag-node';
 export type {
   TriggerRule,
@@ -60,27 +69,33 @@ export type {
   PromptNode,
   BashNode,
   LoopNode,
+  LoopGroupNode,
+  LoopGroupNodeConfig,
   ApprovalNode,
   ApprovalOnReject,
   CancelNode,
   ScriptNode,
+  IncludeNode,
   DagNode,
   EffortLevel,
   ThinkingConfig,
   SandboxSettings,
   AgentDefinition,
+  PiNodeConfig,
 } from './dag-node';
 
 // Workflow definition
 export {
   modelReasoningEffortSchema,
   webSearchModeSchema,
+  workflowRequirementSchema,
   workflowBaseSchema,
   workflowDefinitionSchema,
 } from './workflow';
 export type {
   ModelReasoningEffort,
   WebSearchMode,
+  WorkflowRequirement,
   WorkflowBase,
   WorkflowDefinition,
 } from './workflow';
@@ -105,7 +120,16 @@ export type {
   WorkflowRun,
   ArtifactType,
   ApprovalContext,
+  LoopGateRunMetadata,
 } from './workflow-run';
+
+// Per-node persisted provider sessions
+export { workflowNodeSessionSchema } from './workflow-node-session';
+export type { WorkflowNodeSession } from './workflow-node-session';
+
+// Node typed-output artifacts (output_type metadata)
+export { nodeArtifactSchema } from './node-artifact';
+export type { NodeArtifact } from './node-artifact';
 
 // Result types (non-schema hand-written types)
 export type {
